@@ -1,0 +1,10 @@
+[package]
+name = "eri"
+version = "0.1.0"
+edition = "2024"
+description = "Dedicated Auth service for shocker.cl"
+license = "MIT"
+
+[[bin]]
+name = "eri"
+path = "src/main.rs"

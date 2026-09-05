@@ -10,28 +10,27 @@ pub enum RedirectKind {
     Exact,
     NativeLoopback,
 }
-
 #[derive(Clone, Debug)]
 pub struct RegisteredRedirect {
     uri: String,
     kind: RedirectKind,
 }
-
 #[derive(Clone, Debug)]
 pub struct FirstPartyClient {
     id: String,
+    display_name: String,
     redirects: Vec<RegisteredRedirect>,
     scopes: BTreeSet<String>,
     resources: BTreeSet<String>,
     default_resource: Option<String>,
     browser_origins: BTreeSet<String>,
+    post_logout_redirects: BTreeSet<String>,
 }
-
 #[derive(Clone, Debug, Default)]
 pub struct ClientRegistry {
     clients: HashMap<String, FirstPartyClient>,
+    userinfo_resource: Option<String>,
 }
-
 #[derive(Clone, Debug)]
 pub struct AuthorizationRequest<'a> {
     pub client_id: &'a str,
@@ -41,9 +40,15 @@ pub struct AuthorizationRequest<'a> {
     pub code_challenge: &'a str,
     pub scopes: &'a [&'a str],
     pub resource: Option<&'a str>,
-    pub offline_access_consented: bool,
 }
-
+#[derive(Clone, Debug)]
+pub struct PendingAuthorizationGrant {
+    client_id: String,
+    redirect_uri: String,
+    scopes: Vec<String>,
+    resource: String,
+    code_challenge: String,
+}
 #[derive(Clone, Debug)]
 pub struct ValidatedAuthorizationGrant {
     client_id: String,
@@ -80,28 +85,29 @@ impl RegisteredRedirect {
     pub fn new(uri: impl Into<String>, kind: RedirectKind) -> Result<Self, OAuthError> {
         let uri = uri.into();
         let parsed = safe_redirect(&uri).map_err(|_| OAuthError::InvalidClientDeclaration)?;
-        match kind {
-            RedirectKind::Exact => {}
-            RedirectKind::NativeLoopback => {
-                if parsed.scheme() != "http" || loopback_parts(&uri).is_none() {
-                    return Err(OAuthError::InvalidClientDeclaration);
-                }
-            }
+        if kind == RedirectKind::NativeLoopback
+            && (parsed.scheme() != "http" || loopback_parts(&uri).is_none())
+        {
+            return Err(OAuthError::InvalidClientDeclaration);
         }
         Ok(Self { uri, kind })
     }
 }
 
 impl FirstPartyClient {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: impl Into<String>,
+        display_name: impl Into<String>,
         redirects: Vec<RegisteredRedirect>,
         scopes: impl IntoIterator<Item = impl Into<String>>,
         resources: impl IntoIterator<Item = impl Into<String>>,
         default_resource: Option<String>,
         browser_origins: impl IntoIterator<Item = impl Into<String>>,
+        post_logout_redirects: impl IntoIterator<Item = impl Into<String>>,
     ) -> Result<Self, OAuthError> {
         let id = id.into();
+        let display_name = display_name.into();
         let scopes = scopes.into_iter().map(Into::into).collect::<BTreeSet<_>>();
         let resources = resources
             .into_iter()
@@ -111,11 +117,15 @@ impl FirstPartyClient {
             .into_iter()
             .map(Into::into)
             .collect::<BTreeSet<_>>();
+        let post_logout_redirects = post_logout_redirects
+            .into_iter()
+            .map(Into::into)
+            .collect::<BTreeSet<_>>();
         if id.is_empty()
+            || display_name.trim().is_empty()
             || redirects.is_empty()
             || scopes.is_empty()
-            || scopes.iter().any(|scope| !valid_scope_token(scope))
-            || resources.is_empty()
+            || scopes.iter().any(|s| !valid_scope_token(s))
         {
             return Err(OAuthError::InvalidClientDeclaration);
         }
@@ -125,25 +135,32 @@ impl FirstPartyClient {
             || resources
                 .iter()
                 .any(|r| safe_security_identifier(r).is_err())
-            || browser_origins.iter().any(|origin| {
-                safe_url(origin).is_err()
-                    || Url::parse(origin).is_ok_and(|u| u.path() != "/" || u.query().is_some())
+            || browser_origins.iter().any(|o| {
+                safe_url(o).is_err()
+                    || Url::parse(o).is_ok_and(|u| u.path() != "/" || u.query().is_some())
             })
+            || post_logout_redirects
+                .iter()
+                .any(|r| safe_redirect(r).is_err())
         {
             return Err(OAuthError::InvalidClientDeclaration);
         }
         Ok(Self {
             id,
+            display_name,
             redirects,
             scopes,
             resources,
             default_resource,
             browser_origins,
+            post_logout_redirects,
         })
     }
-
     pub fn id(&self) -> &str {
         &self.id
+    }
+    pub fn display_name(&self) -> &str {
+        &self.display_name
     }
     pub fn browser_origins(&self) -> &BTreeSet<String> {
         &self.browser_origins
@@ -152,72 +169,168 @@ impl FirstPartyClient {
 
 impl ClientRegistry {
     pub fn new(clients: Vec<FirstPartyClient>) -> Result<Self, OAuthError> {
-        let mut by_id = HashMap::new();
+        Self::build(clients, None)
+    }
+    pub fn with_issuer(clients: Vec<FirstPartyClient>, issuer: &Url) -> Result<Self, OAuthError> {
+        let resource = issuer
+            .join("userinfo")
+            .map_err(|_| OAuthError::InvalidClientDeclaration)?
+            .to_string();
+        Self::build(clients, Some(resource))
+    }
+    fn build(
+        clients: Vec<FirstPartyClient>,
+        userinfo_resource: Option<String>,
+    ) -> Result<Self, OAuthError> {
+        let mut map = HashMap::new();
         for client in clients {
-            if by_id.insert(client.id.clone(), client).is_some() {
+            if map.insert(client.id.clone(), client).is_some() {
                 return Err(OAuthError::InvalidClientDeclaration);
             }
         }
-        Ok(Self { clients: by_id })
+        Ok(Self {
+            clients: map,
+            userinfo_resource,
+        })
     }
-
-    pub fn validate(
+    pub fn trusted_redirect(&self, client_id: &str, uri: &str) -> bool {
+        self.clients
+            .get(client_id)
+            .is_some_and(|c| c.redirects.iter().any(|r| redirect_matches(r, uri)))
+    }
+    pub fn valid_post_logout_redirect(&self, client_id: &str, uri: &str) -> bool {
+        self.clients.get(client_id).is_some_and(|c| {
+            c.post_logout_redirects
+                .iter()
+                .any(|r| r.as_bytes() == uri.as_bytes())
+        })
+    }
+    pub fn validate_pending(
         &self,
         request: AuthorizationRequest<'_>,
-    ) -> Result<ValidatedAuthorizationGrant, OAuthError> {
+    ) -> Result<PendingAuthorizationGrant, OAuthError> {
+        self.validate_pending_parts(
+            request.client_id,
+            request.redirect_uri,
+            request.response_type,
+            request.code_challenge_method,
+            request.code_challenge,
+            request.scopes,
+            request.resource,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_pending_parts(
+        &self,
+        client_id: &str,
+        redirect_uri: &str,
+        response_type: &str,
+        method: &str,
+        challenge: &str,
+        scopes: &[&str],
+        resource: Option<&str>,
+    ) -> Result<PendingAuthorizationGrant, OAuthError> {
         let client = self
             .clients
-            .get(request.client_id)
+            .get(client_id)
             .ok_or(OAuthError::UnknownClient)?;
-        if request.response_type != "code" {
+        if response_type != "code" {
             return Err(OAuthError::UnsupportedResponseType);
         }
-        if request.code_challenge_method != "S256" {
+        if method != "S256" {
             return Err(OAuthError::UnsupportedPkceMethod);
         }
-        validate_pkce_challenge(request.code_challenge)?;
+        validate_pkce_challenge(challenge)?;
         if !client
             .redirects
             .iter()
-            .any(|r| redirect_matches(r, request.redirect_uri))
+            .any(|r| redirect_matches(r, redirect_uri))
         {
             return Err(OAuthError::InvalidRedirect);
         }
-        let requested = request
-            .scopes
+        let requested = scopes
             .iter()
             .map(|s| (*s).to_owned())
             .collect::<BTreeSet<_>>();
-        if requested.len() != request.scopes.len()
+        if requested.len() != scopes.len()
             || requested.is_empty()
-            || requested.iter().any(|scope| !valid_scope_token(scope))
+            || requested.iter().any(|s| !valid_scope_token(s))
             || !requested.is_subset(&client.scopes)
         {
             return Err(OAuthError::InvalidScope);
         }
-        let resource = request
-            .resource
+        let resource = resource
             .map(str::to_owned)
             .or_else(|| client.default_resource.clone())
+            .or_else(|| {
+                requested
+                    .contains("openid")
+                    .then(|| self.userinfo_resource.clone())
+                    .flatten()
+            })
             .ok_or(OAuthError::InvalidResource)?;
-        if !client.resources.contains(&resource) {
+        if !(client.resources.contains(&resource)
+            || requested.contains("openid")
+                && self.userinfo_resource.as_deref() == Some(resource.as_str()))
+        {
             return Err(OAuthError::InvalidResource);
         }
-        let issue_refresh_token = requested.contains("offline_access");
-        if issue_refresh_token && !request.offline_access_consented {
-            return Err(OAuthError::ConsentRequired);
-        }
-        Ok(ValidatedAuthorizationGrant {
+        Ok(PendingAuthorizationGrant {
             client_id: client.id.clone(),
-            redirect_uri: request.redirect_uri.to_owned(),
+            redirect_uri: redirect_uri.into(),
             scopes: requested.into_iter().collect(),
             resource,
-            code_challenge: request.code_challenge.to_owned(),
-            issue_refresh_token,
+            code_challenge: challenge.into(),
         })
+    }
+    pub fn revalidate_pending(
+        &self,
+        p: &PendingAuthorizationGrant,
+    ) -> Result<PendingAuthorizationGrant, OAuthError> {
+        let scopes = p.scopes.iter().map(String::as_str).collect::<Vec<_>>();
+        self.validate_pending_parts(
+            &p.client_id,
+            &p.redirect_uri,
+            "code",
+            "S256",
+            &p.code_challenge,
+            &scopes,
+            Some(&p.resource),
+        )
     }
 }
 
+impl PendingAuthorizationGrant {
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+    pub fn redirect_uri(&self) -> &str {
+        &self.redirect_uri
+    }
+    pub fn scopes(&self) -> &[String] {
+        &self.scopes
+    }
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+    pub fn code_challenge(&self) -> &str {
+        &self.code_challenge
+    }
+    pub(crate) fn approve(self, consent: bool) -> Result<ValidatedAuthorizationGrant, OAuthError> {
+        let refresh = self.scopes.iter().any(|s| s == "offline_access");
+        if refresh && !consent {
+            return Err(OAuthError::ConsentRequired);
+        }
+        Ok(ValidatedAuthorizationGrant {
+            client_id: self.client_id,
+            redirect_uri: self.redirect_uri,
+            scopes: self.scopes,
+            resource: self.resource,
+            code_challenge: self.code_challenge,
+            issue_refresh_token: refresh,
+        })
+    }
+}
 impl ValidatedAuthorizationGrant {
     pub fn client_id(&self) -> &str {
         &self.client_id
@@ -262,7 +375,6 @@ fn validate_pkce_verifier(value: &str) -> Result<(), OAuthError> {
         Err(OAuthError::InvalidPkce)
     }
 }
-
 fn validate_pkce_challenge(value: &str) -> Result<(), OAuthError> {
     if value.len() != 43
         || !value
@@ -280,14 +392,12 @@ fn validate_pkce_challenge(value: &str) -> Result<(), OAuthError> {
         Err(OAuthError::InvalidPkce)
     }
 }
-
 fn valid_scope_token(scope: &str) -> bool {
     !scope.is_empty()
         && scope
             .bytes()
             .all(|b| b == b'!' || (b'#'..=b'[').contains(&b) || (b']'..=b'~').contains(&b))
 }
-
 fn safe_url(raw: &str) -> Result<Url, ()> {
     let url = Url::parse(raw).map_err(|_| ())?;
     if url.cannot_be_a_base()
@@ -301,7 +411,6 @@ fn safe_url(raw: &str) -> Result<Url, ()> {
         Ok(url)
     }
 }
-
 fn safe_redirect(raw: &str) -> Result<Url, ()> {
     let url = Url::parse(raw).map_err(|_| ())?;
     if url.scheme().is_empty()
@@ -314,7 +423,6 @@ fn safe_redirect(raw: &str) -> Result<Url, ()> {
         Ok(url)
     }
 }
-
 fn safe_security_identifier(raw: &str) -> Result<(), ()> {
     let url = safe_url(raw)?;
     if url.scheme() == "https" && url.query().is_none() {
@@ -323,7 +431,6 @@ fn safe_security_identifier(raw: &str) -> Result<(), ()> {
         Err(())
     }
 }
-
 fn redirect_matches(registered: &RegisteredRedirect, actual: &str) -> bool {
     if safe_redirect(actual).is_err() {
         return false;
@@ -342,7 +449,6 @@ fn redirect_matches(registered: &RegisteredRedirect, actual: &str) -> bool {
     };
     registered_host == actual_host && registered_suffix.as_bytes() == actual_suffix.as_bytes()
 }
-
 fn loopback_parts(raw: &str) -> Option<(&str, &str)> {
     let rest = raw.strip_prefix("http://")?;
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
@@ -367,4 +473,41 @@ fn loopback_parts(raw: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((host, suffix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offline_access_is_granted_only_by_server_consent() {
+        let client = FirstPartyClient::new(
+            "client",
+            "Client",
+            vec![RegisteredRedirect::new("com.example:/cb", RedirectKind::Exact).unwrap()],
+            ["openid", "offline_access"],
+            ["https://api.example/resource"],
+            None,
+            std::iter::empty::<String>(),
+            std::iter::empty::<String>(),
+        )
+        .unwrap();
+        let registry = ClientRegistry::new(vec![client]).unwrap();
+        let pending = registry
+            .validate_pending(AuthorizationRequest {
+                client_id: "client",
+                redirect_uri: "com.example:/cb",
+                response_type: "code",
+                code_challenge_method: "S256",
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                scopes: &["openid", "offline_access"],
+                resource: Some("https://api.example/resource"),
+            })
+            .unwrap();
+        assert!(matches!(
+            pending.clone().approve(false),
+            Err(OAuthError::ConsentRequired)
+        ));
+        assert!(pending.approve(true).unwrap().issue_refresh_token());
+    }
 }

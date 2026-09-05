@@ -18,6 +18,15 @@ into an authenticated Eri user. The adapter is not connected to an HTTP callback
 in this delivery, and local tests use synthetic signed identities rather than
 live Google credentials.
 
+Persistent browser authorization transactions now retain validated downstream
+requests across process restarts, bind Google callbacks to hashed state and
+browser secrets, and issue authorization codes only after session-bound consent
+and current client-policy checks. Verified Google logins replace a persisted
+profile snapshot and retain optional upstream authentication-time provenance.
+First-party client configuration includes distinct callback, browser-origin,
+resource, scope, and post-logout redirect allowlists. HTTP handlers and consent
+UI are not connected to these internal contracts yet.
+
 The HTTP surface remains limited to liveness/readiness and public JWKS. OIDC and
 authorization-server discovery, authorization/token routes, login, Google
 federation, UserInfo and logout routes remain unavailable. `docs/design.md`

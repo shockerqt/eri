@@ -8,7 +8,7 @@ Type=simple
 User=eri
 Group=eri
 EnvironmentFile=/etc/eri/eri.env
-ExecStart=/usr/local/bin/eri
+ExecStart=/usr/local/bin/eri --config /etc/eri/eri.toml
 Restart=on-failure
 RestartSec=5
 

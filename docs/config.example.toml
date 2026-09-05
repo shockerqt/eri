@@ -1,0 +1,16 @@
+mode = "development"
+issuer = "http://127.0.0.1:18082"
+bind = "127.0.0.1:18082"
+
+[database]
+# Prefer ERI_DATABASE_URL in the service environment. A URL may be placed here,
+# but this file must then be treated as a secret and kept outside Git.
+url_env = "ERI_DATABASE_URL"
+max_connections = 10
+min_connections = 1
+connect_timeout_seconds = 5
+acquire_timeout_seconds = 5
+readiness_timeout_milliseconds = 500
+
+[signing]
+manifest = "keys/manifest.json"

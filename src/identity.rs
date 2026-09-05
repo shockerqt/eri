@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -10,14 +11,26 @@ pub struct ExternalIdentity {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AuthenticatedUser(Uuid);
+pub struct AuthenticatedUser {
+    id: Uuid,
+    upstream_auth_time: Option<DateTime<Utc>>,
+}
 
 impl AuthenticatedUser {
-    pub(crate) fn new(id: Uuid) -> Self {
-        Self(id)
+    pub(crate) fn new(id: Uuid, upstream_auth_time: Option<DateTime<Utc>>) -> Self {
+        Self {
+            id,
+            upstream_auth_time,
+        }
     }
     pub(crate) fn id(self) -> Uuid {
-        self.0
+        self.id
+    }
+    pub(crate) fn upstream_auth_time(self) -> Option<DateTime<Utc>> {
+        self.upstream_auth_time
+    }
+    pub fn subject(self) -> Uuid {
+        self.id
     }
 }
 

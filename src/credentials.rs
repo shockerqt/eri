@@ -19,7 +19,7 @@ pub struct RefreshToken {
 }
 pub struct ProviderSession {
     raw: String,
-    id: Uuid,
+    pub(crate) id: Uuid,
     expires_at: DateTime<Utc>,
 }
 
@@ -67,6 +67,8 @@ pub struct ExchangeResult {
     pub scopes: Vec<String>,
     pub resource: String,
     pub refresh_token: Option<RefreshToken>,
+    pub oidc_nonce: Option<String>,
+    pub upstream_auth_time: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Error)]
@@ -92,8 +94,8 @@ impl CredentialStore {
         let seconds = bounded_seconds(lifetime, 30 * 24 * 60 * 60)?;
         let raw = random_credential();
         let id = Uuid::new_v4();
-        let expires_at: DateTime<Utc> = sqlx::query_scalar("INSERT INTO provider_sessions (id,token_hash,user_id,auth_time,expires_at) SELECT $1,$2,$3,t,t + make_interval(secs => $4::double precision) FROM (SELECT clock_timestamp() AS t) now RETURNING expires_at")
-            .bind(id).bind(hash(&raw)).bind(user.id()).bind(seconds).fetch_one(&self.pool).await?;
+        let expires_at: DateTime<Utc> = sqlx::query_scalar("INSERT INTO provider_sessions (id,token_hash,user_id,auth_time,expires_at,upstream_auth_time) SELECT $1,$2,$3,t,t + make_interval(secs => $4::double precision),$5 FROM (SELECT clock_timestamp() AS t) now RETURNING expires_at")
+            .bind(id).bind(hash(&raw)).bind(user.id()).bind(seconds).bind(user.upstream_auth_time()).fetch_one(&self.pool).await?;
         Ok(ProviderSession {
             raw,
             id,
@@ -122,7 +124,6 @@ impl CredentialStore {
         lifetime: Duration,
     ) -> Result<AuthorizationCode, CredentialError> {
         let seconds = bounded_seconds(lifetime, 60)?;
-        let raw = random_credential();
         let mut tx = self.pool.begin().await?;
         let locked: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM provider_sessions WHERE id=$1 FOR UPDATE")
@@ -141,10 +142,22 @@ impl CredentialStore {
         if !active {
             return Err(CredentialError::InvalidGrant);
         }
-        sqlx::query("INSERT INTO authorization_codes (id,code_hash,session_id,client_id,redirect_uri,scopes,resource,code_challenge,issue_refresh_token,issued_at,expires_at) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,t,LEAST(t + make_interval(secs => $10::double precision),(SELECT expires_at FROM provider_sessions WHERE id=$3)) FROM (SELECT clock_timestamp() AS t) now")
-            .bind(Uuid::new_v4()).bind(hash(&raw)).bind(session.id).bind(grant.client_id()).bind(grant.redirect_uri()).bind(grant.scopes()).bind(grant.resource()).bind(grant.code_challenge()).bind(grant.issue_refresh_token()).bind(seconds).execute(&mut *tx).await?;
+        let upstream_auth_time: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT upstream_auth_time FROM provider_sessions WHERE id=$1")
+                .bind(session.id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let code = insert_authorization_code_tx(
+            &mut tx,
+            session.id,
+            grant,
+            None,
+            upstream_auth_time,
+            seconds,
+        )
+        .await?;
         tx.commit().await?;
-        Ok(AuthorizationCode { raw })
+        Ok(code)
     }
 
     pub async fn exchange_code(
@@ -156,7 +169,7 @@ impl CredentialStore {
         verifier: &str,
     ) -> Result<ExchangeResult, CredentialError> {
         let mut tx = self.pool.begin().await?;
-        let code: Option<CodeRow> = sqlx::query_as("SELECT id,session_id,client_id,redirect_uri,scopes,resource,code_challenge,issue_refresh_token FROM authorization_codes WHERE code_hash=$1").bind(hash(raw)).fetch_optional(&mut *tx).await?;
+        let code: Option<CodeRow> = sqlx::query_as("SELECT id,session_id,client_id,redirect_uri,scopes,resource,code_challenge,issue_refresh_token,oidc_nonce,upstream_auth_time FROM authorization_codes WHERE code_hash=$1").bind(hash(raw)).fetch_optional(&mut *tx).await?;
         let Some(code) = code else {
             return Err(CredentialError::InvalidGrant);
         };
@@ -201,8 +214,8 @@ impl CredentialStore {
             .await?;
         let refresh_token = if code.issue_refresh_token {
             let family_id = Uuid::new_v4();
-            sqlx::query("INSERT INTO refresh_families (id,source_code_id,session_id,user_id,client_id,scopes,resource,issued_at,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,LEAST($8 + interval '30 days',$9))")
-                .bind(family_id).bind(code.id).bind(code.session_id).bind(session.user_id).bind(&code.client_id).bind(&code.scopes).bind(&code.resource).bind(now).bind(session.expires_at).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO refresh_families (id,source_code_id,session_id,user_id,client_id,scopes,resource,issued_at,expires_at,upstream_auth_time) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,LEAST($8 + interval '30 days',$9),$10)")
+                .bind(family_id).bind(code.id).bind(code.session_id).bind(session.user_id).bind(&code.client_id).bind(&code.scopes).bind(&code.resource).bind(now).bind(session.expires_at).bind(code.upstream_auth_time).execute(&mut *tx).await?;
             Some(insert_refresh(&mut tx, family_id, now).await?)
         } else {
             None
@@ -214,6 +227,8 @@ impl CredentialStore {
             scopes: code.scopes,
             resource: code.resource,
             refresh_token,
+            oidc_nonce: code.oidc_nonce,
+            upstream_auth_time: code.upstream_auth_time,
         })
     }
 
@@ -234,7 +249,7 @@ impl CredentialStore {
         .bind(lookup.session_id)
         .fetch_one(&mut *tx)
         .await?;
-        let family: FamilyRow = sqlx::query_as("SELECT client_id,scopes,resource,expires_at,revoked_at FROM refresh_families WHERE id=$1 FOR UPDATE").bind(lookup.family_id).fetch_one(&mut *tx).await?;
+        let family: FamilyRow = sqlx::query_as("SELECT client_id,scopes,resource,expires_at,revoked_at,upstream_auth_time FROM refresh_families WHERE id=$1 FOR UPDATE").bind(lookup.family_id).fetch_one(&mut *tx).await?;
         let member: MemberRow =
             sqlx::query_as("SELECT consumed_at FROM refresh_token_members WHERE id=$1 FOR UPDATE")
                 .bind(lookup.id)
@@ -284,6 +299,8 @@ impl CredentialStore {
             scopes: family.scopes,
             resource: family.resource,
             refresh_token: Some(successor),
+            oidc_nonce: None,
+            upstream_auth_time: family.upstream_auth_time,
         })
     }
 
@@ -330,6 +347,40 @@ async fn insert_refresh(
     Ok(token)
 }
 
+pub(crate) async fn insert_authorization_code_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: Uuid,
+    grant: &ValidatedAuthorizationGrant,
+    oidc_nonce: Option<&str>,
+    upstream_auth_time: Option<DateTime<Utc>>,
+    lifetime_seconds: f64,
+) -> Result<AuthorizationCode, sqlx::Error> {
+    let code = AuthorizationCode {
+        raw: random_credential(),
+    };
+    sqlx::query("INSERT INTO authorization_codes (id,code_hash,session_id,client_id,redirect_uri,scopes,resource,code_challenge,issue_refresh_token,issued_at,expires_at,oidc_nonce,upstream_auth_time) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,t,LEAST(t + make_interval(secs => $10::double precision),(SELECT expires_at FROM provider_sessions WHERE id=$3)),$11,$12 FROM (SELECT clock_timestamp() AS t) now")
+        .bind(Uuid::new_v4()).bind(hash(&code.raw)).bind(session_id).bind(grant.client_id()).bind(grant.redirect_uri()).bind(grant.scopes()).bind(grant.resource()).bind(grant.code_challenge()).bind(grant.issue_refresh_token()).bind(lifetime_seconds).bind(oidc_nonce).bind(upstream_auth_time).execute(&mut **tx).await?;
+    Ok(code)
+}
+
+pub(crate) fn new_provider_session(
+    raw: String,
+    id: Uuid,
+    expires_at: DateTime<Utc>,
+) -> ProviderSession {
+    ProviderSession {
+        raw,
+        id,
+        expires_at,
+    }
+}
+pub(crate) fn random_secret() -> String {
+    random_credential()
+}
+pub(crate) fn secret_hash(raw: &str) -> Vec<u8> {
+    hash(raw)
+}
+
 fn bounded_seconds(duration: Duration, maximum: u64) -> Result<f64, CredentialError> {
     if duration.is_zero() || duration.as_secs() > maximum || duration.subsec_nanos() != 0 {
         Err(CredentialError::InvalidLifetime)
@@ -356,6 +407,8 @@ struct CodeRow {
     resource: String,
     code_challenge: String,
     issue_refresh_token: bool,
+    oidc_nonce: Option<String>,
+    upstream_auth_time: Option<DateTime<Utc>>,
 }
 #[derive(sqlx::FromRow)]
 struct CodeState {
@@ -387,6 +440,7 @@ struct FamilyRow {
     resource: String,
     expires_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
+    upstream_auth_time: Option<DateTime<Utc>>,
 }
 #[derive(sqlx::FromRow)]
 struct MemberRow {
@@ -417,10 +471,12 @@ mod tests {
     fn grant(offline: bool) -> ValidatedAuthorizationGrant {
         let client = FirstPartyClient::new(
             "mobile",
+            "Mobile",
             vec![RegisteredRedirect::new(REDIRECT, RedirectKind::Exact).unwrap()],
             ["openid", "offline_access"],
             [RESOURCE],
             None,
+            std::iter::empty::<String>(),
             std::iter::empty::<String>(),
         )
         .unwrap();
@@ -431,7 +487,7 @@ mod tests {
             &["openid"]
         };
         registry
-            .validate(AuthorizationRequest {
+            .validate_pending(AuthorizationRequest {
                 client_id: "mobile",
                 redirect_uri: REDIRECT,
                 response_type: "code",
@@ -439,8 +495,8 @@ mod tests {
                 code_challenge: &s256_challenge(VERIFIER).unwrap(),
                 scopes,
                 resource: Some(RESOURCE),
-                offline_access_consented: offline,
             })
+            .and_then(|pending| pending.approve(offline))
             .unwrap()
     }
     async fn setup(pool: &PgPool) -> (CredentialStore, ProviderSession) {
@@ -452,7 +508,7 @@ mod tests {
         let store = CredentialStore::new(pool.clone());
         let session = store
             .create_provider_session(
-                AuthenticatedUser::new(user_id),
+                AuthenticatedUser::new(user_id, None),
                 Duration::from_secs(20 * 24 * 60 * 60),
             )
             .await

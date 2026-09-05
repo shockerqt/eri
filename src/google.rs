@@ -89,6 +89,23 @@ impl VerifiedGoogleIdentity {
     pub fn auth_time(&self) -> Option<i64> {
         self.auth_time
     }
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        subject: &str,
+        name: Option<&str>,
+        email: Option<&str>,
+        auth_time: Option<i64>,
+    ) -> Self {
+        Self {
+            subject: subject.into(),
+            name: name.map(Into::into),
+            given_name: None,
+            family_name: None,
+            picture: None,
+            verified_email: email.map(Into::into),
+            auth_time,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

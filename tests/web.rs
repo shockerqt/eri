@@ -51,6 +51,7 @@ async fn foundation_routes_are_truthful_and_public_only(pool: PgPool) {
         signing: SigningConfig {
             manifest: "unused".into(),
         },
+        authorization: None,
     };
     let app = router(
         AppState::new(

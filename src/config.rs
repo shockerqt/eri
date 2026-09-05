@@ -1,3 +1,4 @@
+use crate::oauth::{ClientRegistry, FirstPartyClient, RedirectKind, RegisteredRedirect};
 use serde::Deserialize;
 use std::{
     fs,
@@ -22,6 +23,48 @@ pub struct Config {
     pub bind: std::net::SocketAddr,
     pub database: DatabaseConfig,
     pub signing: SigningConfig,
+    #[serde(default)]
+    pub authorization: Option<AuthorizationConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationConfig {
+    pub google: Option<GoogleClientConfig>,
+    pub clients: Vec<ClientDeclaration>,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoogleClientConfig {
+    pub client_id: String,
+    pub client_secret_env: String,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientDeclaration {
+    pub id: String,
+    pub display_name: String,
+    pub redirects: Vec<RedirectDeclaration>,
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub resources: Vec<String>,
+    pub default_resource: Option<String>,
+    #[serde(default)]
+    pub browser_origins: Vec<String>,
+    #[serde(default)]
+    pub post_logout_redirects: Vec<String>,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedirectDeclaration {
+    pub uri: String,
+    pub kind: ConfiguredRedirectKind,
+}
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfiguredRedirectKind {
+    Exact,
+    NativeLoopback,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -114,7 +157,58 @@ impl Config {
         if self.database.url_env.trim().is_empty() {
             return Err(invalid("database url_env cannot be empty"));
         }
+        if let Some(auth) = &self.authorization
+            && (auth.clients.is_empty()
+                || auth.google.as_ref().is_some_and(|g| {
+                    g.client_id.trim().is_empty() || g.client_secret_env.trim().is_empty()
+                })
+                || self.authorization_registry().is_err())
+        {
+            return Err(invalid("authorization configuration is invalid"));
+        }
         Ok(())
+    }
+    pub fn authorization_registry(&self) -> Result<Option<ClientRegistry>, ConfigError> {
+        self.authorization
+            .as_ref()
+            .map(|auth| {
+                let clients = auth
+                    .clients
+                    .iter()
+                    .map(|c| {
+                        let redirects = c
+                            .redirects
+                            .iter()
+                            .map(|r| {
+                                RegisteredRedirect::new(
+                                    r.uri.clone(),
+                                    match r.kind {
+                                        ConfiguredRedirectKind::Exact => RedirectKind::Exact,
+                                        ConfiguredRedirectKind::NativeLoopback => {
+                                            RedirectKind::NativeLoopback
+                                        }
+                                    },
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|_| invalid("authorization client redirect is invalid"))?;
+                        FirstPartyClient::new(
+                            c.id.clone(),
+                            c.display_name.clone(),
+                            redirects,
+                            c.scopes.clone(),
+                            c.resources.clone(),
+                            c.default_resource.clone(),
+                            c.browser_origins.clone(),
+                            c.post_logout_redirects.clone(),
+                        )
+                        .map_err(|_| invalid("authorization client is invalid"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                ClientRegistry::with_issuer(clients, &self.issuer)
+                    .map_err(|_| invalid("authorization registry is invalid"))
+            })
+            .transpose()
     }
 }
 
@@ -186,6 +280,7 @@ mod tests {
             signing: SigningConfig {
                 manifest: "keys.json".into(),
             },
+            authorization: None,
         }
     }
     #[test]
@@ -253,6 +348,48 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn typed_authorization_builds_reviewed_client_policy() {
+        let mut value = config(Mode::Production, "https://auth.example", "127.0.0.1:8080");
+        value.authorization = Some(AuthorizationConfig {
+            google: Some(GoogleClientConfig {
+                client_id: "google-client".into(),
+                client_secret_env: "ERI_GOOGLE_CLIENT_SECRET".into(),
+            }),
+            clients: vec![ClientDeclaration {
+                id: "web".into(),
+                display_name: "Web application".into(),
+                redirects: vec![RedirectDeclaration {
+                    uri: "https://app.example/callback".into(),
+                    kind: ConfiguredRedirectKind::Exact,
+                }],
+                scopes: vec!["openid".into()],
+                resources: vec![],
+                default_resource: None,
+                browser_origins: vec!["https://app.example".into()],
+                post_logout_redirects: vec!["https://app.example/signed-out".into()],
+            }],
+        });
+        value.validate().unwrap();
+        let registry = value.authorization_registry().unwrap().unwrap();
+        assert!(registry.trusted_redirect("web", "https://app.example/callback"));
+        assert!(!registry.trusted_redirect("web", "https://app.example/signed-out"));
+        assert!(registry.valid_post_logout_redirect("web", "https://app.example/signed-out"));
+    }
+
+    #[test]
+    fn typed_authorization_rejects_unreviewed_or_ambiguous_values() {
+        let mut value = config(Mode::Production, "https://auth.example", "127.0.0.1:8080");
+        value.authorization = Some(AuthorizationConfig {
+            google: Some(GoogleClientConfig {
+                client_id: " ".into(),
+                client_secret_env: "ERI_GOOGLE_CLIENT_SECRET".into(),
+            }),
+            clients: vec![],
+        });
+        assert!(value.validate().is_err());
     }
 
     #[test]

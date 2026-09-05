@@ -7,6 +7,7 @@ fn registry() -> ClientRegistry {
     ClientRegistry::new(vec![
         FirstPartyClient::new(
             "mobile",
+            "Mobile",
             vec![
                 RegisteredRedirect::new(
                     "com.example.app:/oauth/callback?x=%2F",
@@ -33,6 +34,7 @@ fn registry() -> ClientRegistry {
             ["https://api.example/resource"],
             Some("https://api.example/resource".into()),
             ["https://app.example"],
+            ["https://app.example/logout"],
         )
         .unwrap(),
     ])
@@ -42,9 +44,8 @@ fn registry() -> ClientRegistry {
 fn validate<'a>(
     redirect: &'a str,
     scopes: &'a [&'a str],
-    consent: bool,
-) -> Result<eri::ValidatedAuthorizationGrant, eri::OAuthError> {
-    registry().validate(AuthorizationRequest {
+) -> Result<eri::PendingAuthorizationGrant, eri::OAuthError> {
+    registry().validate_pending(AuthorizationRequest {
         client_id: "mobile",
         redirect_uri: redirect,
         response_type: "code",
@@ -52,7 +53,6 @@ fn validate<'a>(
         code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
         scopes,
         resource: Some("https://api.example/resource"),
-        offline_access_consented: consent,
     })
 }
 
@@ -81,7 +81,7 @@ fn redirects_are_byte_exact_except_native_literal_loopback_port() {
         "http://[::1]:49155?raw=%2F",
         "http://127.0.0.1:49156/cb%2Fpart?x=%2F",
     ] {
-        assert!(validate(accepted, &["openid"], false).is_ok(), "{accepted}");
+        assert!(validate(accepted, &["openid"]).is_ok(), "{accepted}");
     }
     for rejected in [
         "https://app.example/oauth?x=%2F",
@@ -97,39 +97,19 @@ fn redirects_are_byte_exact_except_native_literal_loopback_port() {
         "http://127.0.0.1evil:49152/cb?x=%2F",
         "http://127.0.0.1::49152/cb?x=%2F",
     ] {
-        assert!(
-            validate(rejected, &["openid"], false).is_err(),
-            "{rejected}"
-        );
+        assert!(validate(rejected, &["openid"]).is_err(), "{rejected}");
     }
 }
 
 #[test]
-fn policy_restricts_method_scopes_resources_and_offline_consent() {
-    assert!(
-        validate(
-            "https://app.example/OAuth?x=%2F",
-            &["openid", "offline_access"],
-            false
-        )
-        .is_err()
-    );
+fn policy_restricts_method_scopes_and_resources() {
     let grant = validate(
         "https://app.example/OAuth?x=%2F",
         &["offline_access", "openid"],
-        true,
     )
     .unwrap();
-    assert!(grant.issue_refresh_token());
     assert_eq!(grant.resource(), "https://api.example/resource");
-    assert!(
-        validate(
-            "https://app.example/OAuth?x=%2F",
-            &["openid", "openid"],
-            false
-        )
-        .is_err()
-    );
+    assert!(validate("https://app.example/OAuth?x=%2F", &["openid", "openid"],).is_err());
     let mut request = AuthorizationRequest {
         client_id: "mobile",
         redirect_uri: "https://app.example/OAuth?x=%2F",
@@ -138,23 +118,24 @@ fn policy_restricts_method_scopes_resources_and_offline_consent() {
         code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
         scopes: &["openid"],
         resource: Some("https://api.example/other"),
-        offline_access_consented: false,
     };
-    assert!(registry().validate(request.clone()).is_err());
+    assert!(registry().validate_pending(request.clone()).is_err());
     request.response_type = "code";
-    assert!(registry().validate(request.clone()).is_err());
+    assert!(registry().validate_pending(request.clone()).is_err());
     request.resource = Some("https://api.example/resource");
     request.code_challenge_method = "plain";
-    assert!(registry().validate(request).is_err());
+    assert!(registry().validate_pending(request).is_err());
 
     for invalid in ["", "two words", "line\nbreak", "tab\tscope"] {
         assert!(
             FirstPartyClient::new(
                 "bad",
+                "Bad",
                 vec![RegisteredRedirect::new("com.example:/cb", RedirectKind::Exact).unwrap()],
                 [invalid],
                 ["https://api.example/resource"],
                 None,
+                std::iter::empty::<String>(),
                 std::iter::empty::<String>(),
             )
             .is_err()
@@ -179,8 +160,55 @@ fn challenge_is_exact_canonical_s256_output() {
             code_challenge: invalid,
             scopes: &["openid"],
             resource: Some("https://api.example/resource"),
-            offline_access_consented: false,
         };
-        assert!(registry.validate(request).is_err(), "{invalid}");
+        assert!(registry.validate_pending(request).is_err(), "{invalid}");
     }
+}
+
+#[test]
+fn pending_consent_userinfo_and_redirect_trust_are_distinct() {
+    let client = FirstPartyClient::new(
+        "browser",
+        "Browser client",
+        vec![RegisteredRedirect::new("https://app.example/callback", RedirectKind::Exact).unwrap()],
+        ["openid", "offline_access"],
+        std::iter::empty::<String>(),
+        None,
+        ["https://app.example"],
+        ["https://app.example/signed-out"],
+    )
+    .unwrap();
+    let registry = ClientRegistry::with_issuer(
+        vec![client],
+        &url::Url::parse("https://auth.example/").unwrap(),
+    )
+    .unwrap();
+    assert!(registry.trusted_redirect("browser", "https://app.example/callback"));
+    assert!(!registry.trusted_redirect("browser", "https://app.example/signed-out"));
+    assert!(registry.valid_post_logout_redirect("browser", "https://app.example/signed-out"));
+    assert!(!registry.valid_post_logout_redirect("browser", "https://app.example/callback"));
+
+    let pending = registry
+        .validate_pending(AuthorizationRequest {
+            client_id: "browser",
+            redirect_uri: "https://app.example/callback",
+            response_type: "code",
+            code_challenge_method: "S256",
+            code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            scopes: &["openid", "offline_access"],
+            resource: None,
+        })
+        .unwrap();
+    assert_eq!(pending.resource(), "https://auth.example/userinfo");
+
+    let no_openid = registry.validate_pending(AuthorizationRequest {
+        client_id: "browser",
+        redirect_uri: "https://app.example/callback",
+        response_type: "code",
+        code_challenge_method: "S256",
+        code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        scopes: &["offline_access"],
+        resource: Some("https://auth.example/userinfo"),
+    });
+    assert!(no_openid.is_err());
 }

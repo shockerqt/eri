@@ -3,9 +3,19 @@ use crate::{
     google::VerifiedGoogleIdentity,
     identity::{AuthenticatedUser, ExternalIdentity},
 };
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use chrono::{DateTime, Utc};
+use sqlx::{PgPool, Postgres, Transaction, postgres::PgPoolOptions};
 use tokio::time::timeout;
 use uuid::Uuid;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserProfile {
+    pub name: Option<String>,
+    pub given_name: Option<String>,
+    pub family_name: Option<String>,
+    pub picture: Option<String>,
+    pub verified_email: Option<String>,
+}
 
 #[derive(Clone)]
 pub struct Database {
@@ -83,13 +93,88 @@ impl Database {
         &self,
         identity: &VerifiedGoogleIdentity,
     ) -> Result<AuthenticatedUser, sqlx::Error> {
-        let external = ExternalIdentity::google("https://accounts.google.com", identity.subject())
-            .expect("verified Google identity has a valid canonical issuer and subject");
-        self.find_or_create_external_identity(&external)
-            .await
-            .map(AuthenticatedUser::new)
+        let mut tx = self.pool.begin().await?;
+        lock_verified_google_identity_tx(&mut tx, identity).await?;
+        let now = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *tx)
+            .await?;
+        let id = upsert_verified_google_identity_tx(&mut tx, identity, now).await?;
+        tx.commit().await?;
+        Ok(AuthenticatedUser::new(
+            id,
+            identity
+                .auth_time()
+                .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0)),
+        ))
+    }
+    pub async fn user_profile(&self, user_id: Uuid) -> Result<Option<UserProfile>, sqlx::Error> {
+        sqlx::query_as::<_, ProfileRow>("SELECT name,given_name,family_name,picture,verified_email FROM user_profiles WHERE user_id=$1")
+            .bind(user_id).fetch_optional(&self.pool).await.map(|row| row.map(Into::into))
     }
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+}
+
+pub(crate) async fn lock_verified_google_identity_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    identity: &VerifiedGoogleIdentity,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(length($1)::text||':'||$1||$2,0))")
+        .bind("https://accounts.google.com")
+        .bind(identity.subject())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn upsert_verified_google_identity_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    identity: &VerifiedGoogleIdentity,
+    now: DateTime<Utc>,
+) -> Result<Uuid, sqlx::Error> {
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM external_identities WHERE issuer=$1 AND subject=$2",
+    )
+    .bind("https://accounts.google.com")
+    .bind(identity.subject())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let user = if let Some(id) = existing {
+        id
+    } else {
+        let id: Uuid = sqlx::query_scalar("INSERT INTO users DEFAULT VALUES RETURNING id")
+            .fetch_one(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO external_identities(issuer,subject,user_id)VALUES($1,$2,$3)")
+            .bind("https://accounts.google.com")
+            .bind(identity.subject())
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+        id
+    };
+    sqlx::query("INSERT INTO user_profiles(user_id,name,given_name,family_name,picture,verified_email,updated_at)VALUES($1,$2,$3,$4,$5,$6,$7)ON CONFLICT(user_id)DO UPDATE SET name=EXCLUDED.name,given_name=EXCLUDED.given_name,family_name=EXCLUDED.family_name,picture=EXCLUDED.picture,verified_email=EXCLUDED.verified_email,updated_at=EXCLUDED.updated_at")
+        .bind(user).bind(identity.name()).bind(identity.given_name()).bind(identity.family_name()).bind(identity.picture()).bind(identity.verified_email()).bind(now).execute(&mut**tx).await?;
+    Ok(user)
+}
+
+#[derive(sqlx::FromRow)]
+struct ProfileRow {
+    name: Option<String>,
+    given_name: Option<String>,
+    family_name: Option<String>,
+    picture: Option<String>,
+    verified_email: Option<String>,
+}
+impl From<ProfileRow> for UserProfile {
+    fn from(value: ProfileRow) -> Self {
+        Self {
+            name: value.name,
+            given_name: value.given_name,
+            family_name: value.family_name,
+            picture: value.picture,
+            verified_email: value.verified_email,
+        }
     }
 }

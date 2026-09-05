@@ -1,0 +1,14 @@
+{
+  "active": {
+    "kid": "eri-2026-09",
+    "private_key": "eri-2026-09-private.pem",
+    "public_key": "eri-2026-09-public.pem"
+  },
+  "previous": [],
+  "next": [
+    {
+      "kid": "eri-2026-12",
+      "public_key": "eri-2026-12-public.pem"
+    }
+  ]
+}

@@ -1,14 +1,18 @@
-.PHONY: dev test build lint
+.PHONY: dev test build lint check
+
+CONFIG ?= config/eri.toml
 
 dev:
-	cargo run
+	cargo run --locked -- --config "$(CONFIG)"
 
 test:
-	cargo test
+	cargo test --locked
 
 build:
-	cargo build --release
+	cargo build --locked --release
 
 lint:
 	cargo fmt --check
-	cargo clippy -- -D warnings
+	cargo clippy --locked --all-targets -- -D warnings
+
+check: lint test build

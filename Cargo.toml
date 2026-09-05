@@ -5,6 +5,27 @@ edition = "2024"
 description = "Dedicated Auth service for shocker.cl"
 license = "MIT"
 
+[dependencies]
+anyhow = "1.0"
+axum = "0.8"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive", "env"] }
+jsonwebtoken = "9.3"
+rsa = { version = "0.9", features = ["pem"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "migrate", "macros"] }
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+toml = "0.9"
+url = { version = "2.5", features = ["serde"] }
+uuid = { version = "1.18", features = ["serde", "v4"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3.21"
+tower = { version = "0.5", features = ["util"] }
+
 [[bin]]
 name = "eri"
 path = "src/main.rs"

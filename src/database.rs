@@ -1,6 +1,7 @@
 use crate::{
     config::{ConfigError, DatabaseConfig},
-    identity::ExternalIdentity,
+    google::VerifiedGoogleIdentity,
+    identity::{AuthenticatedUser, ExternalIdentity},
 };
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::time::timeout;
@@ -77,6 +78,16 @@ impl Database {
         };
         tx.commit().await?;
         Ok(user_id)
+    }
+    pub async fn find_or_create_verified_google_identity(
+        &self,
+        identity: &VerifiedGoogleIdentity,
+    ) -> Result<AuthenticatedUser, sqlx::Error> {
+        let external = ExternalIdentity::google("https://accounts.google.com", identity.subject())
+            .expect("verified Google identity has a valid canonical issuer and subject");
+        self.find_or_create_external_identity(&external)
+            .await
+            .map(AuthenticatedUser::new)
     }
     pub fn pool(&self) -> &PgPool {
         &self.pool

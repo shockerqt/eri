@@ -11,6 +11,13 @@ one-time authorization codes, strict refresh rotation/replay revocation, token
 revocation and provider-session logout. Credentials are opaque and stored only as
 SHA-256 hashes.
 
+It also includes a Google upstream library with fixed production endpoints,
+bounded code exchange and JWKS fetching, cached RSA verification keys, and a
+verified identity type. Only that verified type can cross the database boundary
+into an authenticated Eri user. The adapter is not connected to an HTTP callback
+in this delivery, and local tests use synthetic signed identities rather than
+live Google credentials.
+
 The HTTP surface remains limited to liveness/readiness and public JWKS. OIDC and
 authorization-server discovery, authorization/token routes, login, Google
 federation, UserInfo and logout routes remain unavailable. `docs/design.md`

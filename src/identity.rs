@@ -13,7 +13,6 @@ pub struct ExternalIdentity {
 pub struct AuthenticatedUser(Uuid);
 
 impl AuthenticatedUser {
-    #[cfg(test)]
     pub(crate) fn new(id: Uuid) -> Self {
         Self(id)
     }

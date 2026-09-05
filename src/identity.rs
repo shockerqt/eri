@@ -1,4 +1,5 @@
 use thiserror::Error;
+use uuid::Uuid;
 
 pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
 
@@ -6,6 +7,19 @@ pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
 pub struct ExternalIdentity {
     issuer: &'static str,
     subject: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticatedUser(Uuid);
+
+impl AuthenticatedUser {
+    #[cfg(test)]
+    pub(crate) fn new(id: Uuid) -> Self {
+        Self(id)
+    }
+    pub(crate) fn id(self) -> Uuid {
+        self.0
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]

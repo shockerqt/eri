@@ -352,10 +352,9 @@ fn loopback_parts(raw: &str) -> Option<(&str, &str)> {
     }
     let (host, port) = if let Some(after) = authority.strip_prefix("[::1]") {
         ("[::1]", after)
-    } else if let Some(after) = authority.strip_prefix("127.0.0.1") {
-        ("127.0.0.1", after)
     } else {
-        return None;
+        let after = authority.strip_prefix("127.0.0.1")?;
+        ("127.0.0.1", after)
     };
     if port.is_empty() {
         return Some((host, suffix));

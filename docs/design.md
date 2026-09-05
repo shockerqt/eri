@@ -11,8 +11,8 @@ owns protected-resource metadata, application data, API authorization and
 WebSocket transport. Staging uses a separate reviewed issuer/environment and
 test data; the production Keycloak route remains unchanged during this goal.
 
-Implement in serial deliveries: executable foundation; Google/code flow;
-renewable sessions; MCP interoperability; measured staging/handoff. Each
+Implement in serial deliveries: executable foundation; credential lifecycle;
+Google adapter; browser/code flow; MCP interoperability; measured staging/handoff. Each
 delivery includes meaningful tests and CI. No successful mock flow will be
 reported as a real Google or MCP-client login.
 
@@ -71,7 +71,8 @@ resource per grant. For an openid grant, also include the explicit configured
 Eri UserInfo endpoint audience so the same access token can retrieve identity
 claims. UserInfo validates that audience and openid, not arbitrary resource tokens.
 ID tokens are distinct JWTs addressed to client_id,
-issued only for openid, with nonce when requested and auth_time; never accepted
+issued only for openid, with nonce when requested and auth_time only when verified
+upstream evidence exists; never accepted
 as API access tokens. Profile/email claims follow scope and verified upstream
 data. Resource audience and ID-token audience are not interchangeable.
 
@@ -126,9 +127,10 @@ host-only Path=/ (__Host- prefix in HTTPS mode); rotate at authentication and
 store hashes server-side. Consent/logout use separate CSRF tokens bound to the
 session and transaction and validate Origin when supplied. Never trust forwarded
 headers to relax cookie/security policy. The provider session has a bounded
-absolute lifetime (initial proposal: 30 days) and auth_time; refresh does not
-silently extend it forever. Support prompt=login/none/consent and max_age according
-to implemented metadata/contracts, explicitly rejecting unsupported values.
+absolute lifetime (initial proposal: 30 days); refresh does not silently extend it
+forever. Keep local session creation time separate from verified upstream auth_time.
+Follow docs/browser-flow-plan.md for prompt=none/consent and conservative handling
+of prompt=login/max_age when Google's verified reauthentication evidence is absent.
 
 Authorization codes are 256-bit opaque random values, stored only as hashes,
 expire within 60 seconds, and are consumed atomically after all bindings/PKCE
@@ -139,8 +141,8 @@ Refresh tokens are opaque 256-bit random values, hashed at rest and bound to a
 grant family, user, client, scopes, resource and absolute expiry (30 days maximum).
 Track every consumed member until family expiry. Rotation locks the family row,
 checks session/grant state, consumes one token and inserts its successor atomically.
-Every path takes locks in the same family-then-token order. Reuse of a consumed
-token revokes the family in a transaction that commits even though the HTTP result
+Every path takes locks in session-then-family-then-token order. Reuse of a consumed
+token after proving its original client/resource bindings revokes the family in a transaction that commits even though the HTTP result
 is invalid_grant. Concurrent refresh has one winner; the losing replay revokes
 the family, so the winner's new refresh cannot be used afterward. No grace window:
 clients serialize refresh and must reauthorize after an ambiguous/lost response.

@@ -1,6 +1,7 @@
 pub mod config;
 pub mod credentials;
 pub mod database;
+pub mod google;
 pub mod identity;
 pub mod keys;
 pub mod oauth;
@@ -12,6 +13,7 @@ pub use credentials::{
     RefreshToken,
 };
 pub use database::Database;
+pub use google::{GoogleAdapter, GoogleError, VerifiedGoogleIdentity};
 pub use identity::{AuthenticatedUser, ExternalIdentity};
 pub use keys::SigningKeys;
 pub use oauth::{

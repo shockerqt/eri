@@ -9,12 +9,16 @@ license = "MIT"
 anyhow = "1.0"
 axum = "0.8"
 base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 jsonwebtoken = "9.3"
+rand = "0.8"
 rsa = { version = "0.9", features = ["pem"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "migrate", "macros"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "migrate", "macros"] }
+subtle = "2.6"
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
 toml = "0.9"

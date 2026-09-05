@@ -4,14 +4,23 @@ Eri is the dedicated Rust Auth service for `auth.shocker.cl`.
 
 The name **eri** is inspired by the name of the creator's cat.
 
-This delivery is an executable foundation, not a complete authorization server.
-It provides typed startup configuration, Google identity persistence,
-liveness/readiness, and public JWKS. It does not expose OIDC or authorization
-server discovery because conforming metadata would require capabilities this
-stage does not implement. Authorization, token, login, federation, refresh,
-revocation, UserInfo, and logout remain unavailable. `docs/design.md` describes
-the planned server, not the current endpoint surface. Do not route OAuth clients
-or production traffic to this stage.
+This delivery provides the executable foundation plus internal OAuth policy and
+PostgreSQL credential/session lifecycle libraries. The library validates explicit
+public clients, exact redirect/resource/scope bindings and S256 PKCE, then supports
+one-time authorization codes, strict refresh rotation/replay revocation, token
+revocation and provider-session logout. Credentials are opaque and stored only as
+SHA-256 hashes.
+
+The HTTP surface remains limited to liveness/readiness and public JWKS. OIDC and
+authorization-server discovery, authorization/token routes, login, Google
+federation, UserInfo and logout routes remain unavailable. `docs/design.md`
+describes the planned complete server. Do not route OAuth clients or production
+traffic to this stage.
+
+Expired authorization codes may be removed after their expiry once any linked
+refresh family has also expired. Provider sessions, refresh families and retained
+refresh-token members may be removed after the family/session absolute expiry.
+Expiry indexes support a future bounded cleanup job; this package does not run one.
 
 ## Run locally
 

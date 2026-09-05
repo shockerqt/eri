@@ -114,6 +114,13 @@ fn signs_and_strictly_verifies_claims() {
         keys.verify::<Claims>(&within_skew, "https://issuer.example", "api")
             .is_ok()
     );
+    let beyond_configured_skew = keys
+        .sign(&claims("https://issuer.example", "api", -40))
+        .unwrap();
+    assert!(
+        keys.verify::<Claims>(&beyond_configured_skew, "https://issuer.example", "api")
+            .is_err()
+    );
     let mut wrong_type = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
     wrong_type.kid = Some("active".into());
     wrong_type.typ = Some("JWT".into());

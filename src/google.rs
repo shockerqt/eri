@@ -204,6 +204,32 @@ impl GoogleAdapter {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test_http(
+        authorize: String,
+        token: String,
+        jwks: String,
+        callback: String,
+    ) -> Self {
+        let http = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        Self::with_parts(
+            "client-1".into(),
+            SecretSource::Test("test-secret".into()),
+            callback,
+            http,
+            Endpoints {
+                authorize,
+                token,
+                jwks,
+            },
+        )
+    }
+
     pub fn authorization_url(
         &self,
         state: &str,

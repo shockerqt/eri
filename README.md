@@ -24,14 +24,15 @@ browser secrets, and issue authorization codes only after session-bound consent
 and current client-policy checks. Verified Google logins replace a persisted
 profile snapshot and retain optional upstream authentication-time provenance.
 First-party client configuration includes distinct callback, browser-origin,
-resource, scope, and post-logout redirect allowlists. HTTP handlers and consent
-UI are not connected to these internal contracts yet.
+resource, scope, and post-logout redirect allowlists.
 
-The HTTP surface remains limited to liveness/readiness and public JWKS. OIDC and
-authorization-server discovery, authorization/token routes, login, Google
-federation, UserInfo and logout routes remain unavailable. `docs/design.md`
-describes the planned complete server. Do not route OAuth clients or production
-traffic to this stage.
+When authorization configuration is present, Eri exposes discovery,
+authorization and Google callback, server-rendered consent, token and revocation,
+UserInfo, and confirmed local logout. Foundation-only configuration continues to
+expose health and JWKS and withholds provider discovery. RP-Initiated Logout hint
+conformance remains deferred, so metadata withholds `end_session_endpoint` and
+`/logout` rejects `id_token_hint`. CIMD/DCR remains deferred. Synthetic tests do
+not replace real Google and application compatibility checks in staging.
 
 Expired authorization codes may be removed after their expiry once any linked
 refresh family has also expired. Provider sessions, refresh families and retained

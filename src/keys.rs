@@ -134,9 +134,17 @@ impl SigningKeys {
     }
 
     pub fn sign<T: Serialize>(&self, claims: &T) -> Result<String, KeyError> {
+        self.sign_typed(claims, "at+jwt")
+    }
+
+    pub fn sign_id<T: Serialize>(&self, claims: &T) -> Result<String, KeyError> {
+        self.sign_typed(claims, "JWT")
+    }
+
+    fn sign_typed<T: Serialize>(&self, claims: &T, token_type: &str) -> Result<String, KeyError> {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(self.active_kid.clone());
-        header.typ = Some("at+jwt".into());
+        header.typ = Some(token_type.into());
         Ok(jsonwebtoken::encode(&header, claims, &self.encoding)?)
     }
 
@@ -147,7 +155,10 @@ impl SigningKeys {
         audience: &str,
     ) -> Result<T, KeyError> {
         let header = jsonwebtoken::decode_header(token)?;
-        if header.alg != Algorithm::RS256 || header.typ.as_deref() != Some("at+jwt") {
+        if header.alg != Algorithm::RS256
+            || header.typ.as_deref() != Some("at+jwt")
+            || has_unsupported_crit(token)
+        {
             return Err(invalid("token algorithm or type is invalid"));
         }
         let kid = header.kid.ok_or_else(|| invalid("token kid is missing"))?;
@@ -162,6 +173,18 @@ impl SigningKeys {
         validation.leeway = CLOCK_SKEW_SECONDS;
         Ok(jsonwebtoken::decode::<T>(token, key, &validation)?.claims)
     }
+}
+
+fn has_unsupported_crit(token: &str) -> bool {
+    let Some(encoded) = token.split('.').next() else {
+        return true;
+    };
+    URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value.get("crit").cloned())
+        .is_some_and(|crit| crit.as_array().is_none_or(|items| !items.is_empty()))
 }
 
 fn add_public(

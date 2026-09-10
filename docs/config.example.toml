@@ -14,3 +14,19 @@ readiness_timeout_milliseconds = 500
 
 [signing]
 manifest = "keys/manifest.json"
+
+# Adding [authorization] enables the complete first-party provider surface and
+# requires the named Google secret environment variable at startup.
+# [authorization.google]
+# client_id = "google-client-id.apps.googleusercontent.com"
+# client_secret_env = "ERI_GOOGLE_CLIENT_SECRET"
+#
+# [[authorization.clients]]
+# id = "balance-web"
+# display_name = "Balance"
+# scopes = ["openid", "profile", "email", "offline_access"]
+# resources = ["https://api.example/resource"]
+# default_resource = "https://api.example/resource"
+# browser_origins = ["https://app.example"]
+# post_logout_redirects = ["https://app.example/signed-out"]
+# redirects = [{ uri = "https://app.example/oauth/callback", kind = "exact" }]

@@ -205,6 +205,43 @@ impl ClientRegistry {
                 .any(|r| r.as_bytes() == uri.as_bytes())
         })
     }
+    pub fn valid_browser_origin(&self, client_id: &str, origin: &str) -> bool {
+        self.clients
+            .get(client_id)
+            .is_some_and(|client| client.browser_origins.contains(origin))
+    }
+    pub fn reviewed_browser_origin(&self, origin: &str) -> bool {
+        self.clients
+            .values()
+            .any(|client| client.browser_origins.contains(origin))
+    }
+    pub fn display_name(&self, client_id: &str) -> Option<&str> {
+        self.clients
+            .get(client_id)
+            .map(|client| client.display_name())
+    }
+    pub fn advertised_scopes(&self) -> BTreeSet<String> {
+        self.clients
+            .values()
+            .flat_map(|client| client.scopes.iter().cloned())
+            .collect()
+    }
+    pub(crate) fn permits_refresh(
+        &self,
+        client_id: &str,
+        scopes: &[String],
+        resource: &str,
+    ) -> bool {
+        let Some(client) = self.clients.get(client_id) else {
+            return false;
+        };
+        let requested = scopes.iter().cloned().collect::<BTreeSet<_>>();
+        requested.len() == scopes.len()
+            && requested.is_subset(&client.scopes)
+            && (client.resources.contains(resource)
+                || requested.contains("openid")
+                    && self.userinfo_resource.as_deref() == Some(resource))
+    }
     pub fn validate_pending(
         &self,
         request: AuthorizationRequest<'_>,

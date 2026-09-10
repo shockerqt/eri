@@ -1,5 +1,5 @@
 use crate::{
-    AuthenticatedUser,
+    AuthenticatedUser, ClientRegistry,
     oauth::{ValidatedAuthorizationGrant, verify_s256},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
+use std::collections::BTreeSet;
 use std::{fmt, time::Duration};
 use thiserror::Error;
 use uuid::Uuid;
@@ -232,6 +233,43 @@ impl CredentialStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn exchange_code_request(
+        &self,
+        raw: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        resource: Option<&str>,
+        verifier: &str,
+        scopes: Option<&[String]>,
+        registry: &ClientRegistry,
+    ) -> Result<ExchangeResult, CredentialError> {
+        let row:Option<(Vec<String>,String,String)>=sqlx::query_as("SELECT scopes,resource,code_challenge FROM authorization_codes WHERE code_hash=$1 AND client_id=$2 AND redirect_uri=$3")
+            .bind(hash(raw)).bind(client_id).bind(redirect_uri).fetch_optional(&self.pool).await?;
+        let Some((stored_scopes, stored_resource, challenge)) = row else {
+            return Err(CredentialError::InvalidGrant);
+        };
+        if resource.is_some_and(|value| value.as_bytes() != stored_resource.as_bytes())
+            || scopes.is_some_and(|value| !same_scopes(value, &stored_scopes))
+        {
+            return Err(CredentialError::InvalidGrant);
+        }
+        let refs = stored_scopes.iter().map(String::as_str).collect::<Vec<_>>();
+        registry
+            .validate_pending_parts(
+                client_id,
+                redirect_uri,
+                "code",
+                "S256",
+                &challenge,
+                &refs,
+                Some(&stored_resource),
+            )
+            .map_err(|_| CredentialError::InvalidGrant)?;
+        self.exchange_code(raw, client_id, redirect_uri, &stored_resource, verifier)
+            .await
+    }
+
     pub async fn rotate_refresh(
         &self,
         raw: &str,
@@ -302,6 +340,27 @@ impl CredentialStore {
             oidc_nonce: None,
             upstream_auth_time: family.upstream_auth_time,
         })
+    }
+
+    pub async fn rotate_refresh_request(
+        &self,
+        raw: &str,
+        client_id: &str,
+        resource: Option<&str>,
+        scopes: Option<&[String]>,
+        registry: &ClientRegistry,
+    ) -> Result<ExchangeResult, CredentialError> {
+        let row:Option<(Vec<String>,String)>=sqlx::query_as("SELECT f.scopes,f.resource FROM refresh_token_members m JOIN refresh_families f ON f.id=m.family_id WHERE m.token_hash=$1 AND f.client_id=$2").bind(hash(raw)).bind(client_id).fetch_optional(&self.pool).await?;
+        let Some((stored_scopes, stored_resource)) = row else {
+            return Err(CredentialError::InvalidGrant);
+        };
+        if resource.is_some_and(|value| value.as_bytes() != stored_resource.as_bytes())
+            || scopes.is_some_and(|value| !same_scopes(value, &stored_scopes))
+            || !registry.permits_refresh(client_id, &stored_scopes, &stored_resource)
+        {
+            return Err(CredentialError::InvalidGrant);
+        }
+        self.rotate_refresh(raw, client_id, &stored_resource).await
     }
 
     pub async fn revoke_refresh(&self, raw: &str, client_id: &str) -> Result<(), CredentialError> {
@@ -395,6 +454,12 @@ fn random_credential() -> String {
 }
 fn hash(raw: &str) -> Vec<u8> {
     Sha256::digest(raw.as_bytes()).to_vec()
+}
+fn same_scopes(left: &[String], right: &[String]) -> bool {
+    let input_len = left.len();
+    let left = left.iter().collect::<BTreeSet<_>>();
+    let right = right.iter().collect::<BTreeSet<_>>();
+    left.len() == input_len && left == right
 }
 
 #[derive(sqlx::FromRow)]

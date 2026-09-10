@@ -159,7 +159,7 @@ impl Config {
         }
         if let Some(auth) = &self.authorization
             && (auth.clients.is_empty()
-                || auth.google.as_ref().is_some_and(|g| {
+                || auth.google.as_ref().is_none_or(|g| {
                     g.client_id.trim().is_empty() || g.client_secret_env.trim().is_empty()
                 })
                 || self.authorization_registry().is_err())

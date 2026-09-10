@@ -41,6 +41,15 @@ pub struct DenialOutcome {
     pub redirect_uri: String,
     pub downstream_state: Option<String>,
 }
+pub struct ConsentView {
+    pub transaction_id: Uuid,
+    pub csrf: String,
+    pub client_name: String,
+    pub scopes: Vec<String>,
+    pub resource: String,
+    pub redirect_uri: String,
+    pub account: String,
+}
 
 macro_rules! redacted {
     ($t:ty,$n:literal) => {
@@ -83,6 +92,12 @@ impl CallbackClaim {
 impl ConsentHandle {
     pub fn transaction_id(&self) -> Uuid {
         self.transaction_id
+    }
+    pub fn submitted(transaction_id: Uuid, csrf: String) -> Self {
+        Self {
+            transaction_id,
+            csrf,
+        }
     }
     pub fn csrf(&self) -> &str {
         &self.csrf
@@ -140,6 +155,16 @@ impl BrowserStore {
             csrf,
         })
     }
+    pub async fn session_upstream_auth_time(
+        &self,
+        session: &ProviderSession,
+    ) -> Result<Option<DateTime<Utc>>, BrowserError> {
+        let mut tx = self.pool.begin().await?;
+        let row = lock_session(&mut tx, session.id).await?;
+        ensure_fresh(&mut tx, &row, None).await?;
+        tx.commit().await?;
+        Ok(row.upstream_auth_time)
+    }
     pub async fn claim_callback(
         &self,
         state: &str,
@@ -183,6 +208,36 @@ impl BrowserStore {
         } else {
             Err(BrowserError::Invalid)
         }
+    }
+    pub async fn deny_callback(
+        &self,
+        claim: &CallbackClaim,
+        registry: &ClientRegistry,
+    ) -> Result<DenialOutcome, BrowserError> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<ConsentRow> = sqlx::query_as("SELECT client_id,redirect_uri,scopes,resource,code_challenge,downstream_state,oidc_nonce,expires_at FROM browser_authorizations WHERE claim_hash=$1 AND stage='callback_claimed' FOR UPDATE")
+            .bind(secret_hash(&claim.raw)).fetch_optional(&mut*tx).await?;
+        let Some(row) = row else {
+            return Err(BrowserError::Invalid);
+        };
+        let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *tx)
+            .await?;
+        if row.expires_at <= now {
+            return Err(BrowserError::Invalid);
+        }
+        revalidate(registry, &row)?;
+        sqlx::query(
+            "UPDATE browser_authorizations SET stage='denied',claim_hash=NULL WHERE claim_hash=$1",
+        )
+        .bind(secret_hash(&claim.raw))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(DenialOutcome {
+            redirect_uri: row.redirect_uri,
+            downstream_state: row.downstream_state,
+        })
     }
     pub async fn complete_callback(
         &self,
@@ -272,6 +327,42 @@ impl BrowserStore {
             downstream_state: row.downstream_state,
         })
     }
+    pub async fn consent_view(
+        &self,
+        session: &ProviderSession,
+        handle: &ConsentHandle,
+        registry: &ClientRegistry,
+    ) -> Result<ConsentView, BrowserError> {
+        let mut tx = self.pool.begin().await?;
+        let session_row = lock_session(&mut tx, session.id).await?;
+        let row = lock_consent(&mut tx, handle.transaction_id, session.id, &handle.csrf).await?;
+        ensure_fresh(&mut tx, &session_row, Some(row.expires_at)).await?;
+        revalidate(registry, &row)?;
+        let client_name = registry
+            .display_name(&row.client_id)
+            .ok_or(BrowserError::PolicyChanged)?
+            .to_owned();
+        let profile: Option<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT verified_email,name FROM user_profiles WHERE user_id=$1")
+                .bind(session_row.user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let account = match profile {
+            Some((Some(email), _)) => email,
+            Some((_, Some(name))) => format!("{name} · {}", session_row.user_id),
+            _ => session_row.user_id.to_string(),
+        };
+        tx.commit().await?;
+        Ok(ConsentView {
+            transaction_id: handle.transaction_id,
+            csrf: handle.csrf.clone(),
+            client_name,
+            scopes: row.scopes,
+            resource: row.resource,
+            redirect_uri: row.redirect_uri,
+            account,
+        })
+    }
     pub async fn deny(
         &self,
         session: &ProviderSession,
@@ -295,6 +386,7 @@ impl BrowserStore {
 
 #[derive(sqlx::FromRow)]
 struct SessionRow {
+    user_id: Uuid,
     upstream_auth_time: Option<DateTime<Utc>>,
     expires_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
@@ -303,7 +395,7 @@ async fn lock_session(
     tx: &mut Transaction<'_, Postgres>,
     id: Uuid,
 ) -> Result<SessionRow, BrowserError> {
-    sqlx::query_as("SELECT upstream_auth_time,expires_at,revoked_at FROM provider_sessions WHERE id=$1 FOR UPDATE")
+    sqlx::query_as("SELECT user_id,upstream_auth_time,expires_at,revoked_at FROM provider_sessions WHERE id=$1 FOR UPDATE")
         .bind(id).fetch_optional(&mut**tx).await?.ok_or(BrowserError::Invalid)
 }
 #[derive(sqlx::FromRow)]

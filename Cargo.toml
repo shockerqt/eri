@@ -28,7 +28,9 @@ uuid = { version = "1.18", features = ["serde", "v4"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tempfile = "3.21"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tower = { version = "0.5", features = ["util"] }
 
 [[bin]]

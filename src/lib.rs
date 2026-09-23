@@ -1,4 +1,5 @@
 pub mod browser;
+pub mod cimd;
 pub mod config;
 pub mod credentials;
 pub mod database;

@@ -1,10 +1,12 @@
 //! Headless MCP authorization contract using a synthetic protected resource.
-//! The resource metadata is a fixture; no Balance or Google service is contacted.
+//! Its HTTP router is a fixture, not Balance; no Balance or Google service is contacted.
 
 use super::*;
 use jsonwebtoken::{DecodingKey, Validation, decode};
 
 const RESOURCE: &str = "https://balance-staging.shocker.cl/api/mcp";
+const RESOURCE_METADATA: &str =
+    "https://balance-staging.shocker.cl/.well-known/oauth-protected-resource/api/mcp";
 const REDIRECT: &str = "https://mcp-client.example.test/oauth/callback";
 const ISSUER: &str = "http://127.0.0.1:18082";
 const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
@@ -17,13 +19,70 @@ async fn protected_resource_to_jwks_and_refresh_contract(pool: PgPool) {
         std::env::var("ERI_TEST_DATABASE_URL").unwrap()
     );
 
-    // RFC 9728 is supplied by the resource server. Start with its public
-    // metadata rather than assuming an Eri endpoint or a configured audience.
-    let protected_resource = json!({
-        "resource": RESOURCE,
-        "authorization_servers": [ISSUER],
-        "scopes_supported": ["openid", "profile", "email"]
-    });
+    // Model only the RFC 9728 HTTP discovery contract. This fixture does not
+    // assert that Balance currently serves either response in staging.
+    let resource_server = Router::new()
+        .route(
+            "/api/mcp",
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header(
+                        header::WWW_AUTHENTICATE,
+                        format!("Bearer resource_metadata=\"{RESOURCE_METADATA}\""),
+                    )
+                    .body(Body::empty())
+                    .unwrap()
+            }),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/api/mcp",
+            get(|| async {
+                axum::Json(json!({
+                    "resource": RESOURCE,
+                    "authorization_servers": [ISSUER],
+                    "scopes_supported": ["openid", "profile", "email"]
+                }))
+            }),
+        );
+    let resource_url = url::Url::parse(RESOURCE).unwrap();
+    let challenge = resource_server
+        .clone()
+        .oneshot(
+            Request::post(resource_url.path())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(challenge.status(), StatusCode::UNAUTHORIZED);
+    let authenticate = challenge.headers()[header::WWW_AUTHENTICATE]
+        .to_str()
+        .unwrap();
+    let metadata_uri = authenticate
+        .strip_prefix("Bearer resource_metadata=\"")
+        .unwrap()
+        .strip_suffix('"')
+        .unwrap();
+    assert_eq!(metadata_uri, RESOURCE_METADATA);
+    let metadata_url = url::Url::parse(metadata_uri).unwrap();
+    assert_eq!(metadata_url.origin(), resource_url.origin());
+    let resource_metadata = resource_server
+        .oneshot(
+            Request::get(metadata_url.path())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resource_metadata.status(), StatusCode::OK);
+    let protected_resource: serde_json::Value =
+        serde_json::from_str(&body(resource_metadata).await).unwrap();
+    assert_eq!(protected_resource["resource"], RESOURCE);
+    assert_eq!(
+        protected_resource["scopes_supported"],
+        json!(["openid", "profile", "email"])
+    );
     let resource = protected_resource["resource"].as_str().unwrap();
     let issuer = protected_resource["authorization_servers"][0]
         .as_str()

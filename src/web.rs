@@ -1322,6 +1322,9 @@ const CSS: &str = "*{box-sizing:border-box}html{background:#111918;color:#f1f2e9
 
 #[cfg(test)]
 mod tests {
+    #[path = "mcp_compatibility.rs"]
+    mod mcp_compatibility;
+
     use super::*;
     use crate::{FirstPartyClient, RedirectKind, RegisteredRedirect, config::DatabaseConfig};
     use axum::{body::Body, extract::Query, http::Request};

@@ -132,6 +132,7 @@ pub fn router(state: AppState) -> Router {
             .route("/.well-known/openid-configuration", get(discovery))
             .route("/.well-known/oauth-authorization-server", get(discovery))
             .route("/authorize", get(authorize_get).post(authorize_post))
+            .route("/federation/google/start", post(google_start))
             .route("/federation/google/callback", get(callback))
             .route("/consent", get(consent_get).post(consent_post))
             .route("/token", post(token).options(api_options))
@@ -364,7 +365,7 @@ async fn authorize_valid(
         .begin_google(&pending, downstream, nonce)
         .await
         .map_err(|_| "server_error".to_owned())?;
-    let url = p
+    let upstream = p
         .google
         .authorization_url(
             start.upstream_state(),
@@ -379,10 +380,71 @@ async fn authorize_valid(
         start.browser_binding(),
         if p.secure { "; Secure" } else { "" }
     );
-    let mut r = Redirect::to(url.as_str()).into_response();
+    let client_name = p.registry.display_name(client).ok_or("server_error")?;
+    let mut r = login_page(
+        render_login(
+            client_name,
+            pending.scopes(),
+            pending.resource(),
+            start.transaction_id(),
+            start.upstream_state(),
+        ),
+        upstream.as_str(),
+        pending.redirect_uri(),
+    );
     r.headers_mut()
         .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
     Ok(sensitive(r))
+}
+
+async fn google_start(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let p = s.0.provider.as_ref().unwrap();
+    if !same_origin(&headers, &p.issuer) {
+        return local_error("Origen inválido");
+    }
+    let Ok(q) = pairs_bytes(&body, 1024) else {
+        return local_error("Solicitud inválida");
+    };
+    let (Ok(id), Ok(state), Ok(action)) = (
+        required(&q, "transaction_id")
+            .and_then(|v| Uuid::parse_str(v).map_err(|_| "invalid_request".into())),
+        required(&q, "state"),
+        required(&q, "action"),
+    ) else {
+        return local_error("Solicitud inválida");
+    };
+    if !matches!(action, "continue" | "cancel") {
+        return local_error("Solicitud inválida");
+    }
+    let name = tx_cookie(id, p.secure);
+    let Some(binding) = cookie(&headers, &name) else {
+        return local_error("La solicitud expiró");
+    };
+    let store = BrowserStore::new(s.0.database.pool().clone());
+    if action == "cancel" {
+        let outcome = store.cancel_google(id, state, binding).await;
+        let Ok(outcome) = outcome else {
+            return local_error("La solicitud expiró");
+        };
+        let mut response = oauth_redirect(
+            &outcome.redirect_uri,
+            outcome.downstream_state.as_deref(),
+            &p.issuer,
+            "access_denied",
+        );
+        clear_transaction_cookie(&mut response, Some(&name), p.secure);
+        return response;
+    }
+    let Ok((nonce, verifier)) = store.start_google(id, state, binding).await else {
+        return local_error("La solicitud expiró");
+    };
+    let Ok(challenge) = crate::oauth::s256_challenge(&verifier) else {
+        return local_error("Solicitud inválida");
+    };
+    let Ok(url) = p.google.authorization_url(state, &nonce, &challenge, false) else {
+        return local_error("No se pudo iniciar el acceso");
+    };
+    sensitive(Redirect::to(url.as_str()).into_response())
 }
 
 async fn callback(
@@ -1058,6 +1120,24 @@ fn render_consent(v: &crate::ConsentView) -> String {
         ),
     )
 }
+fn render_login(
+    client_name: &str,
+    scopes: &[String],
+    resource: &str,
+    id: Uuid,
+    state: &str,
+) -> String {
+    page(
+        &escape(client_name),
+        &format!(
+            "<p>Esta aplicación solicita acceso a tu cuenta.</p><p>Permisos: {}</p><p>Recurso: {}</p><form method=post action=/federation/google/start><input type=hidden name=transaction_id value=\"{}\"><input type=hidden name=state value=\"{}\"><button name=action value=continue>Continuar con Google</button><button class=secondary name=action value=cancel>Cancelar</button></form>",
+            escape(&scopes.join(" · ")),
+            escape(resource),
+            id,
+            escape(state),
+        ),
+    )
+}
 fn render_logout(v: &LogoutChallenge) -> String {
     page(
         "Cerrar sesión",
@@ -1101,6 +1181,27 @@ fn form_page(html: String, redirect_uri: &str) -> Response {
     if let Some(source) = form_action_source(redirect_uri) {
         let policy = format!(
             "default-src 'none'; style-src 'self'; form-action 'self' {source}; frame-ancestors 'none'; base-uri 'none'"
+        );
+        if let Ok(value) = HeaderValue::from_str(&policy) {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_SECURITY_POLICY, value);
+        }
+    }
+    response
+}
+fn login_page(html: String, google_uri: &str, redirect_uri: &str) -> Response {
+    let mut response = sensitive(Html(html).into_response());
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("strict-origin"),
+    );
+    if let (Some(google), Some(client)) = (
+        form_action_source(google_uri),
+        form_action_source(redirect_uri),
+    ) {
+        let policy = format!(
+            "default-src 'none'; style-src 'self'; form-action 'self' {google} {client}; frame-ancestors 'none'; base-uri 'none'"
         );
         if let Ok(value) = HeaderValue::from_str(&policy) {
             response
@@ -1337,6 +1438,40 @@ mod tests {
             .unwrap()
             .into()
     }
+    async fn begin_test_google(app: &Router, authorize: &str) -> Response {
+        let landing = app
+            .clone()
+            .oneshot(Request::get(authorize).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(landing.status(), StatusCode::OK);
+        let set_cookie = landing.headers()[header::SET_COOKIE].clone();
+        let cookie = cookie_value(&landing);
+        let html = body(landing).await;
+        assert!(html.contains("Continuar con Google"));
+        let form = form_urlencoded::Serializer::new(String::new())
+            .append_pair("transaction_id", &form_value(&html, "transaction_id"))
+            .append_pair("state", &form_value(&html, "state"))
+            .append_pair("action", "continue")
+            .finish();
+        let mut response = app
+            .clone()
+            .oneshot(
+                Request::post("/federation/google/start")
+                    .header(header::COOKIE, cookie.clone())
+                    .header(header::ORIGIN, "http://127.0.0.1:18082")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        response
+            .headers_mut()
+            .insert(header::SET_COOKIE, set_cookie);
+        response
+    }
     async fn body(response: Response) -> String {
         String::from_utf8(
             response
@@ -1467,7 +1602,7 @@ mod tests {
         .await
         .unwrap();
         assert!(status.success());
-        assert_eq!(client_hits.load(Ordering::SeqCst), 11);
+        assert_eq!(client_hits.load(Ordering::SeqCst), 12);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1562,6 +1697,65 @@ mod tests {
         assert_eq!(signed_out_page.status(), StatusCode::OK);
         assert!(body(signed_out_page).await.contains("Sesión cerrada"));
         let authorize = "/authorize?client_id=web&redirect_uri=https%3A%2F%2Fapp.example%2Fcallback%3Ffixed%3D%252F&response_type=code&code_challenge_method=S256&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&scope=openid%20profile%20email%20offline_access&resource=https%3A%2F%2Fapi.example%2Fresource&state=downstream&nonce=downstream-nonce";
+        let landing = app
+            .clone()
+            .oneshot(Request::get(authorize).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(landing.status(), StatusCode::OK);
+        assert_eq!(landing.headers()[header::REFERRER_POLICY], "strict-origin");
+        assert_eq!(landing.headers()[header::CACHE_CONTROL], "no-store");
+        let landing_cookie = cookie_value(&landing);
+        let html = body(landing).await;
+        assert!(html.contains("Balance"));
+        for scope in ["openid", "profile", "email", "offline_access"] {
+            assert!(html.contains(scope));
+        }
+        assert!(html.contains("https://api.example/resource"));
+        assert!(html.contains("Continuar con Google"));
+        assert!(html.contains("Cancelar"));
+        let cancel_body = form_urlencoded::Serializer::new(String::new())
+            .append_pair("transaction_id", &form_value(&html, "transaction_id"))
+            .append_pair("state", &form_value(&html, "state"))
+            .append_pair("action", "cancel")
+            .finish();
+        let cancelled = app
+            .clone()
+            .oneshot(
+                Request::post("/federation/google/start")
+                    .header(header::COOKIE, &landing_cookie)
+                    .header(header::ORIGIN, "http://127.0.0.1:18082")
+                    .body(Body::from(cancel_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::SEE_OTHER);
+        assert!(
+            cancelled.headers()[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .contains("error=access_denied")
+        );
+        assert!(
+            cancelled
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|v| v.to_str().unwrap().contains("Max-Age=0"))
+        );
+        let replay = app
+            .clone()
+            .oneshot(
+                Request::post("/federation/google/start")
+                    .header(header::COOKIE, &landing_cookie)
+                    .header(header::ORIGIN, "http://127.0.0.1:18082")
+                    .body(Body::from(cancel_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
         let duplicate = app
             .clone()
             .oneshot(
@@ -1655,11 +1849,7 @@ mod tests {
             );
         }
         for _ in 0..4 {
-            let failed_start = app
-                .clone()
-                .oneshot(Request::get(authorize).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
+            let failed_start = begin_test_google(&app, authorize).await;
             assert_eq!(failed_start.status(), StatusCode::SEE_OTHER);
             assert!(
                 failed_start.headers()[header::SET_COOKIE]
@@ -1707,11 +1897,7 @@ mod tests {
                     })
             );
         }
-        let upstream_error_start = app
-            .clone()
-            .oneshot(Request::get(authorize).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let upstream_error_start = begin_test_google(&app, authorize).await;
         let upstream_error_cookie = cookie_value(&upstream_error_start);
         let upstream_error_url: url::Url = upstream_error_start.headers()[header::LOCATION]
             .to_str()
@@ -1744,11 +1930,7 @@ mod tests {
                 .iter()
                 .any(|value| value.to_str().unwrap().contains("Max-Age=0"))
         );
-        let secure_start = secure_app
-            .clone()
-            .oneshot(Request::get(authorize).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let secure_start = begin_test_google(&secure_app, authorize).await;
         let secure_cookie = cookie_value(&secure_start);
         assert!(secure_cookie.starts_with("__Host-eri_tx_"));
         let secure_url: url::Url = secure_start.headers()[header::LOCATION]
@@ -1806,11 +1988,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(secure_denied.status(), StatusCode::SEE_OTHER);
-        let start = app
-            .clone()
-            .oneshot(Request::get(authorize).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let start = begin_test_google(&app, authorize).await;
         assert_eq!(start.status(), StatusCode::SEE_OTHER);
         let transaction_cookie = cookie_value(&start);
         let upstream_url: url::Url = start.headers()[header::LOCATION]
@@ -2201,15 +2379,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(logout_refresh_use.status(), StatusCode::BAD_REQUEST);
-        let sso = app
-            .oneshot(
-                Request::get(authorize)
-                    .header(header::COOKIE, session_cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let sso = begin_test_google(&app, authorize).await;
         assert_eq!(sso.status(), StatusCode::SEE_OTHER);
         assert!(
             sso.headers()[header::LOCATION]

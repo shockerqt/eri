@@ -91,8 +91,9 @@ lowercased, trimmed, or otherwise normalized.
 
 The ignored browser regression starts Eri, a signed synthetic Google upstream,
 and a separate callback origin on ephemeral loopback listeners. It uses Chromium
-to submit the real consent and logout forms at a narrow viewport and verifies
-that their bound cross-origin redirects complete without CSP violations. Supply
+to submit the Google start, consent, logout, and cancellation forms at a narrow
+viewport and verifies that their bound cross-origin redirects complete without
+CSP violations. Supply
 an installed Playwright module and browser/runtime paths explicitly:
 
 ```sh
@@ -108,10 +109,10 @@ cargo test --locked \
 
 The test has a 60-second child-process timeout. It uses only synthetic identities
 and credentials and does not establish real Google, mobile, or MCP acceptance.
-Optionally set `ERI_BROWSER_ARTIFACT_DIR` to save consent and logout screenshots
+Optionally set `ERI_BROWSER_ARTIFACT_DIR` to save login, consent, and logout screenshots
 from this synthetic fixture. The browser also checks POST origins and referrers
 on form, stylesheet, and client callback requests.
-Consent and logout form documents use `Referrer-Policy: strict-origin`: Chromium
+Login, consent, and logout form documents use `Referrer-Policy: strict-origin`: Chromium
 therefore supplies the same-origin `Origin` needed by the CSRF check while any
 subsequent client navigation receives at most Eri's origin, never the callback,
 state, code, or CSRF query. Other sensitive responses retain `no-referrer`. This

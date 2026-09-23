@@ -69,14 +69,26 @@ with native-agent costs. User retrospective feedback is still pending.
 
 ## Remaining goal evidence
 
+The 2026-09-23 login UI package adds a server-rendered landing page for validated
+first-party authorization requests. It shows the reviewed application, scopes,
+and resource before a user chooses Google. A one-use, browser-bound POST starts
+Google federation; a separate cancel action atomically denies the pending request
+and returns `access_denied` to its validated redirect. The additive migration
+preserves callbacks that were already awaiting Google before this package.
+Coordinator verification passed `make check` (56 standard tests, formatting,
+Clippy and release build) and the explicitly invoked Chromium login, consent,
+logout, and cancel flow at a 390px viewport. Independent Sol review found no
+substantive issue. Chromium evidence uses a signed synthetic Google fixture,
+not a real Google account.
+
 The user selected Gemini Spark. Its [official custom-app guide](https://support.google.com/gemini/answer/17209137)
 documents an MCP URL and manual credentials when DCR is unavailable. It does not
 establish the concrete callback, authentication method, or CIMD behavior needed
 for this integration. Do not substitute Gemini CLI assumptions for a real Spark
 connection.
 
-Still pending: the initial Google sign-in landing UI, verified generic-client
-registration/interoperability, real Google credentials and staging login,
+Still pending: verified generic-client registration/interoperability, real Google
+credentials and staging login,
 Infrastructure staging activation, restart/key-rotation smoke tests, RAM/latency
 measurements, and BAL-033 mobile/API/MCP integration. Production Keycloak cutover
 remains outside the active staging goal. No completion claim follows from this

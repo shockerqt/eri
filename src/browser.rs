@@ -131,9 +131,45 @@ impl BrowserStore {
             upstream_nonce: random_secret(),
             upstream_verifier: random_secret(),
         };
-        sqlx::query("INSERT INTO browser_authorizations(id,stage,upstream_state_hash,browser_binding_hash,upstream_nonce,upstream_verifier,client_id,redirect_uri,scopes,resource,code_challenge,downstream_state,oidc_nonce,created_at,expires_at) SELECT $1,'awaiting_google',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,t,t+interval '10 minutes' FROM(SELECT clock_timestamp()t)n")
+        sqlx::query("INSERT INTO browser_authorizations(id,stage,upstream_state_hash,browser_binding_hash,upstream_nonce,upstream_verifier,client_id,redirect_uri,scopes,resource,code_challenge,downstream_state,oidc_nonce,created_at,expires_at) SELECT $1,'awaiting_start',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,t,t+interval '10 minutes' FROM(SELECT clock_timestamp()t)n")
    .bind(start.transaction_id).bind(secret_hash(&start.upstream_state)).bind(secret_hash(&start.browser_binding)).bind(&start.upstream_nonce).bind(&start.upstream_verifier).bind(pending.client_id()).bind(pending.redirect_uri()).bind(pending.scopes()).bind(pending.resource()).bind(pending.code_challenge()).bind(downstream_state).bind(oidc_nonce).execute(&self.pool).await?;
         Ok(start)
+    }
+    pub async fn start_google(
+        &self,
+        transaction_id: Uuid,
+        state: &str,
+        binding: &str,
+    ) -> Result<(String, String), BrowserError> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "UPDATE browser_authorizations SET stage='awaiting_google' WHERE id=$1 AND upstream_state_hash=$2 AND browser_binding_hash=$3 AND stage='awaiting_start' AND expires_at>clock_timestamp() RETURNING upstream_nonce,upstream_verifier",
+        )
+        .bind(transaction_id)
+        .bind(secret_hash(state))
+        .bind(secret_hash(binding))
+        .fetch_optional(&self.pool)
+        .await?;
+        row.ok_or(BrowserError::Invalid)
+    }
+    pub async fn cancel_google(
+        &self,
+        transaction_id: Uuid,
+        state: &str,
+        binding: &str,
+    ) -> Result<DenialOutcome, BrowserError> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "UPDATE browser_authorizations SET stage='denied',upstream_verifier=NULL,upstream_nonce=NULL WHERE id=$1 AND upstream_state_hash=$2 AND browser_binding_hash=$3 AND stage='awaiting_start' AND expires_at>clock_timestamp() RETURNING redirect_uri,downstream_state",
+        )
+        .bind(transaction_id)
+        .bind(secret_hash(state))
+        .bind(secret_hash(binding))
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(redirect_uri, downstream_state)| DenialOutcome {
+            redirect_uri,
+            downstream_state,
+        })
+        .ok_or(BrowserError::Invalid)
     }
     pub async fn begin_authenticated(
         &self,
@@ -556,7 +592,31 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(stage, "awaiting_google");
+        assert_eq!(stage, "awaiting_start");
+        assert!(
+            store
+                .claim_callback(start.upstream_state(), start.browser_binding())
+                .await
+                .is_err()
+        );
+        store
+            .start_google(
+                start.transaction_id(),
+                start.upstream_state(),
+                start.browser_binding(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .start_google(
+                    start.transaction_id(),
+                    start.upstream_state(),
+                    start.browser_binding()
+                )
+                .await
+                .is_err()
+        );
         let fresh = PgPoolOptions::new()
             .max_connections(3)
             .connect_with((*pool.connect_options()).clone())
@@ -593,6 +653,14 @@ mod tests {
             .begin_google(&pending(&reg, false, Some(RESOURCE)), None, None)
             .await
             .unwrap();
+        store
+            .start_google(
+                expired.transaction_id(),
+                expired.upstream_state(),
+                expired.browser_binding(),
+            )
+            .await
+            .unwrap();
         sqlx::query("UPDATE browser_authorizations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1").bind(expired.transaction_id()).execute(&pool).await.unwrap();
         assert!(
             store
@@ -605,6 +673,14 @@ mod tests {
                 &pending(&reg, true, Some(RESOURCE)),
                 Some("state"),
                 Some("nonce"),
+            )
+            .await
+            .unwrap();
+        store
+            .start_google(
+                start.transaction_id(),
+                start.upstream_state(),
+                start.browser_binding(),
             )
             .await
             .unwrap();
@@ -668,6 +744,14 @@ mod tests {
             .begin_google(&pending(&reg, false, Some(RESOURCE)), None, None)
             .await
             .unwrap();
+        store
+            .start_google(
+                next.transaction_id(),
+                next.upstream_state(),
+                next.browser_binding(),
+            )
+            .await
+            .unwrap();
         let (claim, _, _) = store
             .claim_callback(next.upstream_state(), next.browser_binding())
             .await
@@ -685,6 +769,14 @@ mod tests {
         assert_eq!(cleared.verified_email, None);
         let same_email = store
             .begin_google(&pending(&reg, false, Some(RESOURCE)), None, None)
+            .await
+            .unwrap();
+        store
+            .start_google(
+                same_email.transaction_id(),
+                same_email.upstream_state(),
+                same_email.browser_binding(),
+            )
             .await
             .unwrap();
         let (claim, _, _) = store
@@ -712,6 +804,14 @@ mod tests {
         assert_eq!(user_count, 2, "matching email must not link identities");
         let after_claim = store
             .begin_google(&pending(&reg, false, Some(RESOURCE)), None, None)
+            .await
+            .unwrap();
+        store
+            .start_google(
+                after_claim.transaction_id(),
+                after_claim.upstream_state(),
+                after_claim.browser_binding(),
+            )
             .await
             .unwrap();
         let (claim, _, _) = store
@@ -742,6 +842,14 @@ mod tests {
         assert!(!expired_user);
         let failed = store
             .begin_google(&pending(&reg, false, Some(RESOURCE)), None, None)
+            .await
+            .unwrap();
+        store
+            .start_google(
+                failed.transaction_id(),
+                failed.upstream_state(),
+                failed.browser_binding(),
+            )
             .await
             .unwrap();
         let (claim, _, _) = store
@@ -929,6 +1037,14 @@ mod tests {
             .begin_google(&pending(&reg, false, Some(RESOURCE)), None, None)
             .await
             .unwrap();
+        store
+            .start_google(
+                start.transaction_id(),
+                start.upstream_state(),
+                start.browser_binding(),
+            )
+            .await
+            .unwrap();
         let (claim, _, _) = store
             .claim_callback(start.upstream_state(), start.browser_binding())
             .await
@@ -997,6 +1113,14 @@ mod tests {
         let reg = registry(true);
         let start = store
             .begin_google(&pending(&reg, false, Some(RESOURCE)), None, None)
+            .await
+            .unwrap();
+        store
+            .start_google(
+                start.transaction_id(),
+                start.upstream_state(),
+                start.browser_binding(),
+            )
             .await
             .unwrap();
         let (claim, _, _) = store

@@ -59,7 +59,18 @@ if (!eriOrigin || !clientOrigin) throw new Error('eri and client origins are req
       nonce: 'browser-nonce',
     }).toString();
     await page.goto(authorize.toString());
-    await page.getByText('browser@example.test').waitFor();
+    await page.getByRole('heading', { name: 'Balance' }).waitFor();
+    await page.getByText('Recurso: https://api.example/resource').waitFor();
+    const loginFitsMobile = await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth);
+    if (!loginFitsMobile) throw new Error('login page overflows the mobile viewport');
+    await capture('login-mobile');
+    await page.getByRole('button', { name: 'Continuar con Google' }).click();
+    try {
+      await page.getByText('browser@example.test').waitFor({ timeout: 10000 });
+    } catch (_) {
+      const text = await page.locator('main').innerText().catch(() => 'no Eri page');
+      throw new Error(`Google return did not reach consent: ${text.slice(0, 240)}; POST status ${lastPostStatus || 'unknown'}; Origin ${JSON.stringify(lastPostOrigin)}`);
+    }
     const fitsMobile = await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth);
     if (!fitsMobile) throw new Error('consent page overflows the mobile viewport');
     await capture('consent-mobile');
@@ -93,13 +104,22 @@ if (!eriOrigin || !clientOrigin) throw new Error('eri and client origins are req
     if (!page.url().includes('state=signed-out-state')) {
       throw new Error('logout callback omitted state');
     }
+    await page.goto(authorize.toString());
+    await page.getByRole('heading', { name: 'Balance' }).waitFor();
+    await Promise.all([
+      page.waitForURL(url => url.origin === clientOrigin && url.pathname === '/callback'),
+      page.getByRole('button', { name: 'Cancelar' }).click(),
+    ]);
+    if (!page.url().includes('error=access_denied') || !page.url().includes('state=browser-state')) {
+      throw new Error('cancellation omitted the bound client error or state');
+    }
     if (clientReferrers.some(value => value && value !== `${eriOrigin}/`)) {
       throw new Error('cross-origin navigation disclosed more than the Eri origin');
     }
     if (formReferrers.some(value => value && value !== `${eriOrigin}/`)) {
       throw new Error('form or stylesheet request disclosed a sensitive referrer path');
     }
-    if (postOrigins.length !== 2 || postOrigins.some(value => value !== eriOrigin)) {
+    if (postOrigins.length !== 4 || postOrigins.some(value => value !== eriOrigin)) {
       throw new Error('browser forms did not preserve the exact Eri Origin');
     }
     if (cspErrors.length) throw new Error(`CSP browser errors: ${cspErrors.join('\n')}`);

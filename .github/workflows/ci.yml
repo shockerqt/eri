@@ -34,6 +34,9 @@ jobs:
           persist-credentials: false
       - name: Record exact source revision
         run: test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

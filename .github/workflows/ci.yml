@@ -47,9 +47,10 @@ jobs:
         run: |
           mkdir -p artifact
           cp target/release/eri artifact/eri
+          cp target/release/examples/staging-benchmark artifact/eri-benchmark
           git rev-parse HEAD > artifact/SOURCE_SHA
           rustc -vV | sed -n 's/^host: //p' > artifact/RUST_TARGET
-          (cd artifact && sha256sum eri > SHA256SUMS)
+          (cd artifact && sha256sum eri eri-benchmark > SHA256SUMS)
           (cd artifact && sha256sum --check SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:

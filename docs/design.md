@@ -156,8 +156,34 @@ lifetime. Bound persistence growth with expiry indexes and documented cleanup.
 
 ## Generic MCP client metadata
 
-Implement CIMD against MCP authorization 2026-07-28 and its referenced CIMD draft.
-Recheck the pinned contract when implementing the compatibility package.
+The fetcher foundation exposes immutable operation leases. Cache hits preserve
+the original monotonic deadline (at most five minutes); a non-cacheable response
+has a five-second operation lease and is never retained as a cached document.
+Same-client concurrent cache misses fail promptly while one fetch is in flight,
+preventing out-of-order publication of different responses. Cancellation releases
+that in-flight reservation. Other client IDs retain the existing global bound.
+
+The version-one durable security binding contains the exact client URL, the full
+sorted set of registered redirect strings and their exact/native-loopback kinds,
+and effective refresh permission (metadata permission intersected with local
+policy). Redirect additions, removals and refresh permission changes require new
+authorization. Display names, redirect ordering and inert extensions are excluded.
+Existing grant scopes/resources remain authoritative and require current local
+policy validation. Additive nullable JSONB columns preserve existing first-party
+grants; a dynamic binding must never be inferred for a first-party NULL record.
+
+The browser/code/family stores propagate this binding in their existing owner
+transactions. Locked-row checks reject classification or security-binding changes
+before consumption and replay effects. Lease checks follow blocking locks and
+precede mutation/commit; an expired lease completes rollback before at most one
+new resolution outside transaction locks. Every downstream redirecting exit,
+including cancellation and denial, revalidates current policy and the binding.
+A local lease describes bounded snapshot freshness; it cannot make a remote
+metadata change atomic with a local PostgreSQL commit. See [CIMD](cimd.md) for
+configuration and availability tradeoffs. Support is advertised only when the
+explicit optional local policy is configured.
+
+The CIMD path follows MCP authorization 2026-07-28 and its referenced CIMD draft.
 Bind client_id to the fetched document's identity and
 exact redirect declarations; treat metadata as untrusted. Support HTTPS only,
 no credentials/fragment, deny private/loopback/link-local/reserved destinations,

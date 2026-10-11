@@ -106,6 +106,8 @@ impl ConsentHandle {
 
 #[derive(Debug, Error)]
 pub enum BrowserError {
+    #[error("metadata lease expired")]
+    MetadataExpired,
     #[error("browser authorization is invalid or expired")]
     Invalid,
     #[error("authorization policy changed")]
@@ -114,9 +116,32 @@ pub enum BrowserError {
     Database(#[from] sqlx::Error),
 }
 
+// Complete rollback before an HTTP caller can retry resolution outside locks.
+macro_rules! checked_policy {
+    ($expression:expr, $tx:ident) => {
+        match $expression {
+            Ok(value) => value,
+            Err(error) => {
+                $tx.rollback().await?;
+                return Err(error);
+            }
+        }
+    };
+}
 impl BrowserStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+    pub async fn transaction_client_id(&self, id: Uuid) -> Result<String, BrowserError> {
+        sqlx::query_scalar("SELECT client_id FROM browser_authorizations WHERE id=$1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(BrowserError::Invalid)
+    }
+    pub async fn callback_client_id(&self, claim: &CallbackClaim) -> Result<String, BrowserError> {
+        sqlx::query_scalar("SELECT client_id FROM browser_authorizations WHERE claim_hash=$1 AND stage='callback_claimed'")
+            .bind(secret_hash(&claim.raw)).fetch_optional(&self.pool).await?.ok_or(BrowserError::Invalid)
     }
     pub async fn begin_google(
         &self,
@@ -131,8 +156,12 @@ impl BrowserStore {
             upstream_nonce: random_secret(),
             upstream_verifier: random_secret(),
         };
-        sqlx::query("INSERT INTO browser_authorizations(id,stage,upstream_state_hash,browser_binding_hash,upstream_nonce,upstream_verifier,client_id,redirect_uri,scopes,resource,code_challenge,downstream_state,oidc_nonce,created_at,expires_at) SELECT $1,'awaiting_start',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,t,t+interval '10 minutes' FROM(SELECT clock_timestamp()t)n")
-   .bind(start.transaction_id).bind(secret_hash(&start.upstream_state)).bind(secret_hash(&start.browser_binding)).bind(&start.upstream_nonce).bind(&start.upstream_verifier).bind(pending.client_id()).bind(pending.redirect_uri()).bind(pending.scopes()).bind(pending.resource()).bind(pending.code_challenge()).bind(downstream_state).bind(oidc_nonce).execute(&self.pool).await?;
+        let mut tx = self.pool.begin().await?;
+        checked_policy!(pending.ensure_fresh().map_err(policy_error), tx);
+        sqlx::query("INSERT INTO browser_authorizations(id,stage,upstream_state_hash,browser_binding_hash,upstream_nonce,upstream_verifier,client_id,redirect_uri,scopes,resource,code_challenge,downstream_state,oidc_nonce,cimd_binding,created_at,expires_at) SELECT $1,'awaiting_start',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,t,t+interval '10 minutes' FROM(SELECT clock_timestamp()t)n")
+   .bind(start.transaction_id).bind(secret_hash(&start.upstream_state)).bind(secret_hash(&start.browser_binding)).bind(&start.upstream_nonce).bind(&start.upstream_verifier).bind(pending.client_id()).bind(pending.redirect_uri()).bind(pending.scopes()).bind(pending.resource()).bind(pending.code_challenge()).bind(downstream_state).bind(oidc_nonce).bind(pending.cimd_binding_json()).execute(&mut *tx).await?;
+        checked_policy!(pending.ensure_fresh().map_err(policy_error), tx);
+        tx.commit().await?;
         Ok(start)
     }
     pub async fn start_google(
@@ -157,19 +186,36 @@ impl BrowserStore {
         state: &str,
         binding: &str,
     ) -> Result<DenialOutcome, BrowserError> {
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
-            "UPDATE browser_authorizations SET stage='denied',upstream_verifier=NULL,upstream_nonce=NULL WHERE id=$1 AND upstream_state_hash=$2 AND browser_binding_hash=$3 AND stage='awaiting_start' AND expires_at>clock_timestamp() RETURNING redirect_uri,downstream_state",
-        )
-        .bind(transaction_id)
-        .bind(secret_hash(state))
-        .bind(secret_hash(binding))
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|(redirect_uri, downstream_state)| DenialOutcome {
-            redirect_uri,
-            downstream_state,
+        self.cancel_google_bound(transaction_id, state, binding, None)
+            .await
+    }
+    pub async fn cancel_google_with_registry(
+        &self,
+        transaction_id: Uuid,
+        state: &str,
+        binding: &str,
+        registry: &ClientRegistry,
+    ) -> Result<DenialOutcome, BrowserError> {
+        self.cancel_google_bound(transaction_id, state, binding, Some(registry))
+            .await
+    }
+    async fn cancel_google_bound(
+        &self,
+        transaction_id: Uuid,
+        state: &str,
+        binding: &str,
+        registry: Option<&ClientRegistry>,
+    ) -> Result<DenialOutcome, BrowserError> {
+        let mut tx = self.pool.begin().await?;
+        let row: ConsentRow = sqlx::query_as("SELECT client_id,redirect_uri,scopes,resource,code_challenge,downstream_state,oidc_nonce,expires_at,cimd_binding::text AS cimd_binding FROM browser_authorizations WHERE id=$1 AND upstream_state_hash=$2 AND browser_binding_hash=$3 AND stage='awaiting_start' AND expires_at>clock_timestamp() FOR UPDATE").bind(transaction_id).bind(secret_hash(state)).bind(secret_hash(binding)).fetch_optional(&mut *tx).await?.ok_or(BrowserError::Invalid)?;
+        checked_policy!(validate_optional_registry(registry, &row), tx);
+        sqlx::query("UPDATE browser_authorizations SET stage='denied',upstream_verifier=NULL,upstream_nonce=NULL WHERE id=$1").bind(transaction_id).execute(&mut *tx).await?;
+        checked_policy!(validate_optional_registry(registry, &row), tx);
+        tx.commit().await?;
+        Ok(DenialOutcome {
+            redirect_uri: row.redirect_uri,
+            downstream_state: row.downstream_state,
         })
-        .ok_or(BrowserError::Invalid)
     }
     pub async fn begin_authenticated(
         &self,
@@ -183,8 +229,10 @@ impl BrowserStore {
         let mut tx = self.pool.begin().await?;
         let session_row = lock_session(&mut tx, session.id).await?;
         ensure_fresh(&mut tx, &session_row, None).await?;
-        sqlx::query("INSERT INTO browser_authorizations(id,stage,csrf_hash,session_id,client_id,redirect_uri,scopes,resource,code_challenge,downstream_state,oidc_nonce,created_at,expires_at)SELECT $1,'awaiting_consent',$2,$3,$4,$5,$6,$7,$8,$9,$10,t,t+interval '10 minutes'FROM(SELECT clock_timestamp()t)n")
-   .bind(id).bind(secret_hash(&csrf)).bind(session.id).bind(pending.client_id()).bind(pending.redirect_uri()).bind(pending.scopes()).bind(pending.resource()).bind(pending.code_challenge()).bind(downstream_state).bind(oidc_nonce).execute(&mut*tx).await?;
+        checked_policy!(pending.ensure_fresh().map_err(policy_error), tx);
+        sqlx::query("INSERT INTO browser_authorizations(id,stage,csrf_hash,session_id,client_id,redirect_uri,scopes,resource,code_challenge,downstream_state,oidc_nonce,cimd_binding,created_at,expires_at)SELECT $1,'awaiting_consent',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,t,t+interval '10 minutes'FROM(SELECT clock_timestamp()t)n")
+   .bind(id).bind(secret_hash(&csrf)).bind(session.id).bind(pending.client_id()).bind(pending.redirect_uri()).bind(pending.scopes()).bind(pending.resource()).bind(pending.code_challenge()).bind(downstream_state).bind(oidc_nonce).bind(pending.cimd_binding_json()).execute(&mut*tx).await?;
+        checked_policy!(pending.ensure_fresh().map_err(policy_error), tx);
         tx.commit().await?;
         Ok(ConsentHandle {
             transaction_id: id,
@@ -251,7 +299,7 @@ impl BrowserStore {
         registry: &ClientRegistry,
     ) -> Result<DenialOutcome, BrowserError> {
         let mut tx = self.pool.begin().await?;
-        let row: Option<ConsentRow> = sqlx::query_as("SELECT client_id,redirect_uri,scopes,resource,code_challenge,downstream_state,oidc_nonce,expires_at FROM browser_authorizations WHERE claim_hash=$1 AND stage='callback_claimed' FOR UPDATE")
+        let row: Option<ConsentRow> = sqlx::query_as("SELECT client_id,redirect_uri,scopes,resource,code_challenge,downstream_state,oidc_nonce,expires_at,cimd_binding::text AS cimd_binding FROM browser_authorizations WHERE claim_hash=$1 AND stage='callback_claimed' FOR UPDATE")
             .bind(secret_hash(&claim.raw)).fetch_optional(&mut*tx).await?;
         let Some(row) = row else {
             return Err(BrowserError::Invalid);
@@ -262,13 +310,14 @@ impl BrowserStore {
         if row.expires_at <= now {
             return Err(BrowserError::Invalid);
         }
-        revalidate(registry, &row)?;
+        checked_policy!(revalidate(registry, &row), tx);
         sqlx::query(
             "UPDATE browser_authorizations SET stage='denied',claim_hash=NULL WHERE claim_hash=$1",
         )
         .bind(secret_hash(&claim.raw))
         .execute(&mut *tx)
         .await?;
+        checked_policy!(revalidate(registry, &row), tx);
         tx.commit().await?;
         Ok(DenialOutcome {
             redirect_uri: row.redirect_uri,
@@ -281,12 +330,34 @@ impl BrowserStore {
         identity: &VerifiedGoogleIdentity,
         session_lifetime: Duration,
     ) -> Result<LoginCompletion, BrowserError> {
+        self.complete_callback_bound(claim, identity, session_lifetime, None)
+            .await
+    }
+    pub async fn complete_callback_with_registry(
+        &self,
+        claim: &CallbackClaim,
+        identity: &VerifiedGoogleIdentity,
+        session_lifetime: Duration,
+        registry: &ClientRegistry,
+    ) -> Result<LoginCompletion, BrowserError> {
+        self.complete_callback_bound(claim, identity, session_lifetime, Some(registry))
+            .await
+    }
+    async fn complete_callback_bound(
+        &self,
+        claim: &CallbackClaim,
+        identity: &VerifiedGoogleIdentity,
+        session_lifetime: Duration,
+        registry: Option<&ClientRegistry>,
+    ) -> Result<LoginCompletion, BrowserError> {
         let seconds = bounded_seconds(session_lifetime, 30 * 24 * 60 * 60)?;
         let mut tx = self.pool.begin().await?;
         let row:Option<(Uuid,DateTime<Utc>)>=sqlx::query_as("SELECT id,expires_at FROM browser_authorizations WHERE claim_hash=$1 AND stage='callback_claimed' FOR UPDATE").bind(secret_hash(&claim.raw)).fetch_optional(&mut*tx).await?;
         let Some((transaction_id, expires)) = row else {
             return Err(BrowserError::Invalid);
         };
+        let policy_row: ConsentRow = sqlx::query_as("SELECT client_id,redirect_uri,scopes,resource,code_challenge,downstream_state,oidc_nonce,expires_at,cimd_binding::text AS cimd_binding FROM browser_authorizations WHERE id=$1 FOR UPDATE").bind(transaction_id).fetch_one(&mut *tx).await?;
+        checked_policy!(validate_optional_registry(registry, &policy_row), tx);
         let session_raw = random_secret();
         let session_id = Uuid::new_v4();
         let upstream_auth_time = identity
@@ -294,6 +365,11 @@ impl BrowserStore {
             .and_then(|v| DateTime::<Utc>::from_timestamp(v, 0));
         let mut staged = tx.begin().await?;
         lock_verified_google_identity_tx(&mut staged, identity).await?;
+        if let Err(error) = validate_optional_registry(registry, &policy_row) {
+            staged.rollback().await?;
+            tx.rollback().await?;
+            return Err(error);
+        }
         let profile_time: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *staged)
             .await?;
@@ -312,12 +388,18 @@ impl BrowserStore {
             tx.commit().await?;
             return Err(BrowserError::Invalid);
         }
+        if let Err(error) = validate_optional_registry(registry, &policy_row) {
+            staged.rollback().await?;
+            tx.rollback().await?;
+            return Err(error);
+        }
         staged.commit().await?;
         let csrf = random_secret();
         let changed=sqlx::query("UPDATE browser_authorizations SET stage='awaiting_consent',session_id=$2,csrf_hash=$3,claim_hash=NULL WHERE id=$1 AND stage='callback_claimed'").bind(transaction_id).bind(session_id).bind(secret_hash(&csrf)).execute(&mut*tx).await?.rows_affected();
         if changed != 1 {
             return Err(BrowserError::Invalid);
         }
+        checked_policy!(validate_optional_registry(registry, &policy_row), tx);
         tx.commit().await?;
         Ok(LoginCompletion {
             session: new_provider_session(session_raw, session_id, session_expiry),
@@ -337,10 +419,8 @@ impl BrowserStore {
         let session_row = lock_session(&mut tx, session.id).await?;
         let row = lock_consent(&mut tx, handle.transaction_id, session.id, &handle.csrf).await?;
         ensure_fresh(&mut tx, &session_row, Some(row.expires_at)).await?;
-        let pending = revalidate(registry, &row)?;
-        let grant = pending
-            .approve(true)
-            .map_err(|_| BrowserError::PolicyChanged)?;
+        let pending = checked_policy!(revalidate(registry, &row), tx);
+        let grant = checked_policy!(pending.approve(true).map_err(policy_error), tx);
         let code = insert_authorization_code_tx(
             &mut tx,
             session.id,
@@ -356,6 +436,7 @@ impl BrowserStore {
         .bind(handle.transaction_id)
         .execute(&mut *tx)
         .await?;
+        checked_policy!(revalidate(registry, &row), tx);
         tx.commit().await?;
         Ok(ConsentOutcome {
             code,
@@ -373,7 +454,7 @@ impl BrowserStore {
         let session_row = lock_session(&mut tx, session.id).await?;
         let row = lock_consent(&mut tx, handle.transaction_id, session.id, &handle.csrf).await?;
         ensure_fresh(&mut tx, &session_row, Some(row.expires_at)).await?;
-        revalidate(registry, &row)?;
+        checked_policy!(revalidate(registry, &row), tx);
         let client_name = registry
             .display_name(&row.client_id)
             .ok_or(BrowserError::PolicyChanged)?
@@ -388,6 +469,7 @@ impl BrowserStore {
             Some((_, Some(name))) => format!("{name} · {}", session_row.user_id),
             _ => session_row.user_id.to_string(),
         };
+        checked_policy!(revalidate(registry, &row), tx);
         tx.commit().await?;
         Ok(ConsentView {
             transaction_id: handle.transaction_id,
@@ -404,14 +486,32 @@ impl BrowserStore {
         session: &ProviderSession,
         handle: &ConsentHandle,
     ) -> Result<DenialOutcome, BrowserError> {
+        self.deny_bound(session, handle, None).await
+    }
+    pub async fn deny_with_registry(
+        &self,
+        session: &ProviderSession,
+        handle: &ConsentHandle,
+        registry: &ClientRegistry,
+    ) -> Result<DenialOutcome, BrowserError> {
+        self.deny_bound(session, handle, Some(registry)).await
+    }
+    async fn deny_bound(
+        &self,
+        session: &ProviderSession,
+        handle: &ConsentHandle,
+        registry: Option<&ClientRegistry>,
+    ) -> Result<DenialOutcome, BrowserError> {
         let mut tx = self.pool.begin().await?;
         let session_row = lock_session(&mut tx, session.id).await?;
         let row = lock_consent(&mut tx, handle.transaction_id, session.id, &handle.csrf).await?;
         ensure_fresh(&mut tx, &session_row, Some(row.expires_at)).await?;
+        checked_policy!(validate_optional_registry(registry, &row), tx);
         sqlx::query("UPDATE browser_authorizations SET stage='denied',csrf_hash=NULL WHERE id=$1")
             .bind(handle.transaction_id)
             .execute(&mut *tx)
             .await?;
+        checked_policy!(validate_optional_registry(registry, &row), tx);
         tx.commit().await?;
         Ok(DenialOutcome {
             redirect_uri: row.redirect_uri,
@@ -444,6 +544,7 @@ struct ConsentRow {
     downstream_state: Option<String>,
     oidc_nonce: Option<String>,
     expires_at: DateTime<Utc>,
+    cimd_binding: Option<String>,
 }
 async fn lock_consent(
     tx: &mut Transaction<'_, Postgres>,
@@ -451,7 +552,7 @@ async fn lock_consent(
     session: Uuid,
     csrf: &str,
 ) -> Result<ConsentRow, BrowserError> {
-    sqlx::query_as("SELECT client_id,redirect_uri,scopes,resource,code_challenge,downstream_state,oidc_nonce,expires_at FROM browser_authorizations WHERE id=$1 AND session_id=$2 AND csrf_hash=$3 AND stage='awaiting_consent' FOR UPDATE").bind(id).bind(session).bind(secret_hash(csrf)).fetch_optional(&mut**tx).await?.ok_or(BrowserError::Invalid)
+    sqlx::query_as("SELECT client_id,redirect_uri,scopes,resource,code_challenge,downstream_state,oidc_nonce,expires_at,cimd_binding::text AS cimd_binding FROM browser_authorizations WHERE id=$1 AND session_id=$2 AND csrf_hash=$3 AND stage='awaiting_consent' FOR UPDATE").bind(id).bind(session).bind(secret_hash(csrf)).fetch_optional(&mut**tx).await?.ok_or(BrowserError::Invalid)
 }
 async fn ensure_fresh(
     tx: &mut Transaction<'_, Postgres>,
@@ -474,6 +575,8 @@ fn revalidate(
     reg: &ClientRegistry,
     row: &ConsentRow,
 ) -> Result<PendingAuthorizationGrant, BrowserError> {
+    reg.validate_binding(&row.client_id, row.cimd_binding.as_deref())
+        .map_err(policy_error)?;
     let scopes = row.scopes.iter().map(String::as_str).collect::<Vec<_>>();
     reg.validate_pending_parts(
         &row.client_id,
@@ -484,7 +587,23 @@ fn revalidate(
         &scopes,
         Some(&row.resource),
     )
-    .map_err(|_| BrowserError::PolicyChanged)
+    .map_err(policy_error)
+}
+fn policy_error(error: crate::OAuthError) -> BrowserError {
+    match error {
+        crate::OAuthError::MetadataExpired => BrowserError::MetadataExpired,
+        _ => BrowserError::PolicyChanged,
+    }
+}
+fn validate_optional_registry(
+    registry: Option<&ClientRegistry>,
+    row: &ConsentRow,
+) -> Result<(), BrowserError> {
+    match registry {
+        Some(registry) => revalidate(registry, row).map(|_| ()),
+        None if row.cimd_binding.is_none() => Ok(()),
+        None => Err(BrowserError::PolicyChanged),
+    }
 }
 fn bounded_seconds(d: Duration, max: u64) -> Result<f64, BrowserError> {
     if d.is_zero() || d.as_secs() > max || d.subsec_nanos() != 0 {

@@ -74,6 +74,8 @@ pub struct ExchangeResult {
 
 #[derive(Debug, Error)]
 pub enum CredentialError {
+    #[error("metadata lease expired")]
+    MetadataExpired,
     #[error("invalid grant")]
     InvalidGrant,
     #[error("credential lifetime is invalid")]
@@ -148,6 +150,10 @@ impl CredentialStore {
                 .bind(session.id)
                 .fetch_one(&mut *tx)
                 .await?;
+        if grant.ensure_fresh().is_err() {
+            tx.rollback().await?;
+            return Err(CredentialError::MetadataExpired);
+        }
         let code = insert_authorization_code_tx(
             &mut tx,
             session.id,
@@ -157,6 +163,10 @@ impl CredentialStore {
             seconds,
         )
         .await?;
+        if grant.ensure_fresh().is_err() {
+            tx.rollback().await?;
+            return Err(CredentialError::MetadataExpired);
+        }
         tx.commit().await?;
         Ok(code)
     }
@@ -169,8 +179,21 @@ impl CredentialStore {
         resource: &str,
         verifier: &str,
     ) -> Result<ExchangeResult, CredentialError> {
+        self.exchange_code_bound(raw, client_id, redirect_uri, resource, verifier, None)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn exchange_code_bound(
+        &self,
+        raw: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        resource: &str,
+        verifier: &str,
+        registry: Option<&ClientRegistry>,
+    ) -> Result<ExchangeResult, CredentialError> {
         let mut tx = self.pool.begin().await?;
-        let code: Option<CodeRow> = sqlx::query_as("SELECT id,session_id,client_id,redirect_uri,scopes,resource,code_challenge,issue_refresh_token,oidc_nonce,upstream_auth_time FROM authorization_codes WHERE code_hash=$1").bind(hash(raw)).fetch_optional(&mut *tx).await?;
+        let code: Option<CodeRow> = sqlx::query_as("SELECT id,session_id,client_id,redirect_uri,scopes,resource,code_challenge,issue_refresh_token,oidc_nonce,upstream_auth_time,cimd_binding::text AS cimd_binding FROM authorization_codes WHERE code_hash=$1").bind(hash(raw)).fetch_optional(&mut *tx).await?;
         let Some(code) = code else {
             return Err(CredentialError::InvalidGrant);
         };
@@ -197,11 +220,48 @@ impl CredentialStore {
         .bind(code.id)
         .fetch_one(&mut *tx)
         .await?;
+        let current: CodeRow = sqlx::query_as("SELECT id,session_id,client_id,redirect_uri,scopes,resource,code_challenge,issue_refresh_token,oidc_nonce,upstream_auth_time,cimd_binding::text AS cimd_binding FROM authorization_codes WHERE id=$1 FOR UPDATE").bind(code.id).fetch_one(&mut *tx).await?;
+        if current.session_id != code.session_id
+            || current.client_id != client_id
+            || current.redirect_uri != redirect_uri
+            || current.resource != resource
+            || !verify_s256(verifier, &current.code_challenge)
+        {
+            return Err(CredentialError::InvalidGrant);
+        }
+        let code = current;
+        if let Err(error) = check_binding(registry, client_id, code.cimd_binding.as_deref()) {
+            tx.rollback().await?;
+            return Err(error);
+        }
+        if let Some(registry) = registry {
+            let scopes = code.scopes.iter().map(String::as_str).collect::<Vec<_>>();
+            if let Err(error) = registry.validate_pending_parts(
+                client_id,
+                redirect_uri,
+                "code",
+                "S256",
+                &code.code_challenge,
+                &scopes,
+                Some(resource),
+            ) {
+                tx.rollback().await?;
+                return Err(credential_policy_error(error));
+            }
+        }
         let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *tx)
             .await?;
+        if let Err(error) = check_binding(registry, client_id, code.cimd_binding.as_deref()) {
+            tx.rollback().await?;
+            return Err(error);
+        }
         if locked.consumed_at.is_some() {
             sqlx::query("UPDATE refresh_families SET revoked_at=COALESCE(revoked_at,$2) WHERE source_code_id=$1").bind(code.id).bind(now).execute(&mut *tx).await?;
+            if let Err(error) = check_binding(registry, client_id, code.cimd_binding.as_deref()) {
+                tx.rollback().await?;
+                return Err(error);
+            }
             tx.commit().await?;
             return Err(CredentialError::InvalidGrant);
         }
@@ -215,12 +275,16 @@ impl CredentialStore {
             .await?;
         let refresh_token = if code.issue_refresh_token {
             let family_id = Uuid::new_v4();
-            sqlx::query("INSERT INTO refresh_families (id,source_code_id,session_id,user_id,client_id,scopes,resource,issued_at,expires_at,upstream_auth_time) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,LEAST($8 + interval '30 days',$9),$10)")
-                .bind(family_id).bind(code.id).bind(code.session_id).bind(session.user_id).bind(&code.client_id).bind(&code.scopes).bind(&code.resource).bind(now).bind(session.expires_at).bind(code.upstream_auth_time).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO refresh_families (id,source_code_id,session_id,user_id,client_id,scopes,resource,issued_at,expires_at,upstream_auth_time,cimd_binding) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,LEAST($8 + interval '30 days',$9),$10,$11::jsonb)")
+                .bind(family_id).bind(code.id).bind(code.session_id).bind(session.user_id).bind(&code.client_id).bind(&code.scopes).bind(&code.resource).bind(now).bind(session.expires_at).bind(code.upstream_auth_time).bind(&code.cimd_binding).execute(&mut *tx).await?;
             Some(insert_refresh(&mut tx, family_id, now).await?)
         } else {
             None
         };
+        if let Err(error) = check_binding(registry, client_id, code.cimd_binding.as_deref()) {
+            tx.rollback().await?;
+            return Err(error);
+        }
         tx.commit().await?;
         Ok(ExchangeResult {
             user_id: session.user_id,
@@ -265,9 +329,16 @@ impl CredentialStore {
                 &refs,
                 Some(&stored_resource),
             )
-            .map_err(|_| CredentialError::InvalidGrant)?;
-        self.exchange_code(raw, client_id, redirect_uri, &stored_resource, verifier)
-            .await
+            .map_err(credential_policy_error)?;
+        self.exchange_code_bound(
+            raw,
+            client_id,
+            redirect_uri,
+            &stored_resource,
+            verifier,
+            Some(registry),
+        )
+        .await
     }
 
     pub async fn rotate_refresh(
@@ -275,6 +346,16 @@ impl CredentialStore {
         raw: &str,
         client_id: &str,
         resource: &str,
+    ) -> Result<ExchangeResult, CredentialError> {
+        self.rotate_refresh_bound(raw, client_id, resource, None)
+            .await
+    }
+    async fn rotate_refresh_bound(
+        &self,
+        raw: &str,
+        client_id: &str,
+        resource: &str,
+        registry: Option<&ClientRegistry>,
     ) -> Result<ExchangeResult, CredentialError> {
         let mut tx = self.pool.begin().await?;
         let lookup: Option<TokenLookup> = sqlx::query_as("SELECT m.id,m.family_id,f.session_id FROM refresh_token_members m JOIN refresh_families f ON f.id=m.family_id WHERE m.token_hash=$1").bind(hash(raw)).fetch_optional(&mut *tx).await?;
@@ -287,7 +368,7 @@ impl CredentialStore {
         .bind(lookup.session_id)
         .fetch_one(&mut *tx)
         .await?;
-        let family: FamilyRow = sqlx::query_as("SELECT client_id,scopes,resource,expires_at,revoked_at,upstream_auth_time FROM refresh_families WHERE id=$1 FOR UPDATE").bind(lookup.family_id).fetch_one(&mut *tx).await?;
+        let family: FamilyRow = sqlx::query_as("SELECT client_id,scopes,resource,expires_at,revoked_at,upstream_auth_time,cimd_binding::text AS cimd_binding FROM refresh_families WHERE id=$1 FOR UPDATE").bind(lookup.family_id).fetch_one(&mut *tx).await?;
         let member: MemberRow =
             sqlx::query_as("SELECT consumed_at FROM refresh_token_members WHERE id=$1 FOR UPDATE")
                 .bind(lookup.id)
@@ -297,9 +378,22 @@ impl CredentialStore {
         if family.client_id != client_id || family.resource.as_bytes() != resource.as_bytes() {
             return Err(CredentialError::InvalidGrant);
         }
+        if let Err(error) = check_binding(registry, client_id, family.cimd_binding.as_deref()) {
+            tx.rollback().await?;
+            return Err(error);
+        }
+        if registry.is_some_and(|registry| {
+            !registry.permits_refresh(client_id, &family.scopes, &family.resource)
+        }) {
+            return Err(CredentialError::InvalidGrant);
+        }
         let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *tx)
             .await?;
+        if let Err(error) = check_binding(registry, client_id, family.cimd_binding.as_deref()) {
+            tx.rollback().await?;
+            return Err(error);
+        }
         if member.consumed_at.is_some() {
             sqlx::query(
                 "UPDATE refresh_families SET revoked_at=COALESCE(revoked_at,$2) WHERE id=$1",
@@ -308,6 +402,10 @@ impl CredentialStore {
             .bind(now)
             .execute(&mut *tx)
             .await?;
+            if let Err(error) = check_binding(registry, client_id, family.cimd_binding.as_deref()) {
+                tx.rollback().await?;
+                return Err(error);
+            }
             tx.commit().await?;
             return Err(CredentialError::InvalidGrant);
         }
@@ -330,6 +428,10 @@ impl CredentialStore {
             .bind(successor_id)
             .execute(&mut *tx)
             .await?;
+        if let Err(error) = check_binding(registry, client_id, family.cimd_binding.as_deref()) {
+            tx.rollback().await?;
+            return Err(error);
+        }
         tx.commit().await?;
         Ok(ExchangeResult {
             user_id: session.user_id,
@@ -360,7 +462,8 @@ impl CredentialStore {
         {
             return Err(CredentialError::InvalidGrant);
         }
-        self.rotate_refresh(raw, client_id, &stored_resource).await
+        self.rotate_refresh_bound(raw, client_id, &stored_resource, Some(registry))
+            .await
     }
 
     pub async fn revoke_refresh(&self, raw: &str, client_id: &str) -> Result<(), CredentialError> {
@@ -417,8 +520,8 @@ pub(crate) async fn insert_authorization_code_tx(
     let code = AuthorizationCode {
         raw: random_credential(),
     };
-    sqlx::query("INSERT INTO authorization_codes (id,code_hash,session_id,client_id,redirect_uri,scopes,resource,code_challenge,issue_refresh_token,issued_at,expires_at,oidc_nonce,upstream_auth_time) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,t,LEAST(t + make_interval(secs => $10::double precision),(SELECT expires_at FROM provider_sessions WHERE id=$3)),$11,$12 FROM (SELECT clock_timestamp() AS t) now")
-        .bind(Uuid::new_v4()).bind(hash(&code.raw)).bind(session_id).bind(grant.client_id()).bind(grant.redirect_uri()).bind(grant.scopes()).bind(grant.resource()).bind(grant.code_challenge()).bind(grant.issue_refresh_token()).bind(lifetime_seconds).bind(oidc_nonce).bind(upstream_auth_time).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO authorization_codes (id,code_hash,session_id,client_id,redirect_uri,scopes,resource,code_challenge,issue_refresh_token,issued_at,expires_at,oidc_nonce,upstream_auth_time,cimd_binding) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,t,LEAST(t + make_interval(secs => $10::double precision),(SELECT expires_at FROM provider_sessions WHERE id=$3)),$11,$12,$13::jsonb FROM (SELECT clock_timestamp() AS t) now")
+        .bind(Uuid::new_v4()).bind(hash(&code.raw)).bind(session_id).bind(grant.client_id()).bind(grant.redirect_uri()).bind(grant.scopes()).bind(grant.resource()).bind(grant.code_challenge()).bind(grant.issue_refresh_token()).bind(lifetime_seconds).bind(oidc_nonce).bind(upstream_auth_time).bind(grant.cimd_binding_json()).execute(&mut **tx).await?;
     Ok(code)
 }
 
@@ -440,6 +543,28 @@ pub(crate) fn secret_hash(raw: &str) -> Vec<u8> {
     hash(raw)
 }
 
+fn credential_policy_error(error: crate::OAuthError) -> CredentialError {
+    match error {
+        crate::OAuthError::MetadataExpired => CredentialError::MetadataExpired,
+        _ => CredentialError::InvalidGrant,
+    }
+}
+fn check_binding(
+    registry: Option<&ClientRegistry>,
+    client: &str,
+    binding: Option<&str>,
+) -> Result<(), CredentialError> {
+    match registry {
+        Some(registry) => registry
+            .validate_binding(client, binding)
+            .map_err(|error| match error {
+                crate::OAuthError::MetadataExpired => CredentialError::MetadataExpired,
+                _ => CredentialError::InvalidGrant,
+            }),
+        None if binding.is_none() => Ok(()),
+        None => Err(CredentialError::InvalidGrant),
+    }
+}
 fn bounded_seconds(duration: Duration, maximum: u64) -> Result<f64, CredentialError> {
     if duration.is_zero() || duration.as_secs() > maximum || duration.subsec_nanos() != 0 {
         Err(CredentialError::InvalidLifetime)
@@ -474,6 +599,7 @@ struct CodeRow {
     issue_refresh_token: bool,
     oidc_nonce: Option<String>,
     upstream_auth_time: Option<DateTime<Utc>>,
+    cimd_binding: Option<String>,
 }
 #[derive(sqlx::FromRow)]
 struct CodeState {
@@ -506,6 +632,7 @@ struct FamilyRow {
     expires_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
     upstream_auth_time: Option<DateTime<Utc>>,
+    cimd_binding: Option<String>,
 }
 #[derive(sqlx::FromRow)]
 struct MemberRow {

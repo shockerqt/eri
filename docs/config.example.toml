@@ -30,3 +30,12 @@ manifest = "keys/manifest.json"
 # browser_origins = ["https://app.example"]
 # post_logout_redirects = ["https://app.example/signed-out"]
 # redirects = [{ uri = "https://app.example/oauth/callback", kind = "exact" }]
+#
+# CIMD remains disabled unless this explicit table is added. Review the server's
+# scope/resource authority before enabling it; metadata grants neither authority
+# nor browser origins, logout redirects, or a default resource.
+# [authorization.cimd]
+# scopes = ["openid", "offline_access"]
+# resources = ["https://api.example/mcp"]
+# allow_refresh = false # omitted also means false; true still requires metadata
+#                       # refresh_token declaration and explicit offline consent.

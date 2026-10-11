@@ -32,6 +32,51 @@ pub struct Config {
 pub struct AuthorizationConfig {
     pub google: Option<GoogleClientConfig>,
     pub clients: Vec<ClientDeclaration>,
+    #[serde(default)]
+    pub cimd: Option<CimdPolicyConfig>,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CimdPolicyConfig {
+    pub scopes: Vec<String>,
+    pub resources: Vec<String>,
+    #[serde(default)]
+    pub allow_refresh: bool,
+}
+impl CimdPolicyConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        use std::collections::BTreeSet;
+        if self.scopes.is_empty()
+            || self.scopes.len() > 64
+            || self.resources.is_empty()
+            || self.resources.len() > 32
+            || self.scopes.iter().collect::<BTreeSet<_>>().len() != self.scopes.len()
+            || self.resources.iter().collect::<BTreeSet<_>>().len() != self.resources.len()
+            || !self.scopes.iter().any(|s| s != "offline_access")
+        {
+            return Err(invalid("CIMD policy is invalid"));
+        }
+        FirstPartyClient::new(
+            "cimd-policy",
+            "CIMD policy",
+            vec![
+                RegisteredRedirect::new("https://policy.example.org/callback", RedirectKind::Exact)
+                    .map_err(|_| invalid("CIMD policy is invalid"))?,
+            ],
+            self.scopes.clone(),
+            self.resources.clone(),
+            None,
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+        )
+        .map(|_| ())
+        .map_err(|_| invalid("CIMD policy is invalid"))
+    }
+    pub(crate) fn advertised_scopes(&self) -> impl Iterator<Item = &String> {
+        self.scopes
+            .iter()
+            .filter(|scope| self.allow_refresh || scope.as_str() != "offline_access")
+    }
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -165,6 +210,13 @@ impl Config {
                 || self.authorization_registry().is_err())
         {
             return Err(invalid("authorization configuration is invalid"));
+        }
+        if let Some(policy) = self
+            .authorization
+            .as_ref()
+            .and_then(|auth| auth.cimd.as_ref())
+        {
+            policy.validate()?;
         }
         Ok(())
     }
@@ -354,6 +406,7 @@ mod tests {
     fn typed_authorization_builds_reviewed_client_policy() {
         let mut value = config(Mode::Production, "https://auth.example", "127.0.0.1:8080");
         value.authorization = Some(AuthorizationConfig {
+            cimd: None,
             google: Some(GoogleClientConfig {
                 client_id: "google-client".into(),
                 client_secret_env: "ERI_GOOGLE_CLIENT_SECRET".into(),
@@ -383,6 +436,7 @@ mod tests {
     fn typed_authorization_rejects_unreviewed_or_ambiguous_values() {
         let mut value = config(Mode::Production, "https://auth.example", "127.0.0.1:8080");
         value.authorization = Some(AuthorizationConfig {
+            cimd: None,
             google: Some(GoogleClientConfig {
                 client_id: " ".into(),
                 client_secret_env: "ERI_GOOGLE_CLIENT_SECRET".into(),
@@ -404,5 +458,29 @@ mod tests {
         let wrapped = anyhow::Error::new(error);
         assert!(!format!("{wrapped:#}").contains(sentinel));
         assert!(!format!("{wrapped:?}").contains(sentinel));
+    }
+    #[test]
+    fn cimd_policy_requires_explicit_bounded_local_authority() {
+        let policy: CimdPolicyConfig = toml::from_str(
+            "scopes = ['openid', 'offline_access']\nresources = ['https://api.example.org/mcp']",
+        )
+        .unwrap();
+        assert!(!policy.allow_refresh);
+        assert_eq!(
+            policy.advertised_scopes().cloned().collect::<Vec<_>>(),
+            vec!["openid"]
+        );
+        assert!(policy.validate().is_ok());
+        for text in [
+            "scopes=[]\nresources=['https://api.example.org/mcp']",
+            "scopes=['openid']\nresources=[]",
+            "scopes=['openid','openid']\nresources=['https://api.example.org/mcp']",
+            "scopes=['offline_access']\nresources=['https://api.example.org/mcp']",
+            "scopes=['openid']\nresources=['not-a-resource']",
+        ] {
+            let policy: CimdPolicyConfig = toml::from_str(text).unwrap();
+            assert!(policy.validate().is_err());
+        }
+        assert!(toml::from_str::<CimdPolicyConfig>("scopes=['openid']\nresources=['https://api.example.org/mcp']\nbrowser_origins=['https://client.example.org']").is_err());
     }
 }

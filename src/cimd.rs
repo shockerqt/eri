@@ -2,15 +2,15 @@
 //! The policy resolver must still authorize scopes, resources, and browser origins.
 use reqwest::{StatusCode, header};
 use serde::{
-    Deserialize, Deserializer,
+    Deserialize, Deserializer, Serialize,
     de::{self, MapAccess, Visitor},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -24,6 +24,8 @@ const MAX_REDIRECTS: usize = 16;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CACHE_TTL: Duration = Duration::from_secs(300);
+// Non-cacheable responses may authorize one bounded operation, never a cache hit.
+const NON_CACHEABLE_LEASE: Duration = Duration::from_secs(5);
 type BoxFuture<T> = Pin<Box<dyn Future<Output = Result<T, CimdError>> + Send>>;
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +63,85 @@ impl ClientMetadataDocument {
     }
     pub fn refresh_allowed(&self) -> bool {
         self.refresh_allowed
+    }
+}
+
+/// Durable security identity; cosmetic fields and remote extensions are excluded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CimdSecurityBinding {
+    version: u8,
+    client_id: String,
+    redirects: Vec<CimdBoundRedirect>,
+    refresh_allowed: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CimdBoundRedirect {
+    uri: String,
+    kind: CimdRedirectKind,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CimdRedirectKind {
+    Exact,
+    NativeLoopback,
+}
+impl ClientMetadataDocument {
+    pub fn security_binding(&self, server_allows_refresh: bool) -> CimdSecurityBinding {
+        let mut redirects: Vec<_> = self
+            .redirect_uris
+            .iter()
+            .map(|uri| CimdBoundRedirect {
+                uri: uri.clone(),
+                kind: if uri.starts_with("http://") {
+                    CimdRedirectKind::NativeLoopback
+                } else {
+                    CimdRedirectKind::Exact
+                },
+            })
+            .collect();
+        redirects.sort_by(|a, b| a.uri.as_bytes().cmp(b.uri.as_bytes()));
+        CimdSecurityBinding {
+            version: 1,
+            client_id: self.client_id.clone(),
+            redirects,
+            refresh_allowed: self.refresh_allowed && server_allows_refresh,
+        }
+    }
+}
+/// Immutable operation snapshot. Cache hits retain this exact monotonic deadline.
+#[derive(Debug)]
+pub struct LeasedClientMetadata {
+    document: Arc<ClientMetadataDocument>,
+    valid_until: Instant,
+}
+impl LeasedClientMetadata {
+    #[cfg(test)]
+    pub(crate) fn for_test(client_id: &str, body: &[u8], lease: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            document: Arc::new(validate_document(client_id, body).unwrap()),
+            valid_until: Instant::now() + lease,
+        })
+    }
+    pub fn document(&self) -> &ClientMetadataDocument {
+        &self.document
+    }
+    pub fn is_fresh(&self) -> bool {
+        Instant::now() < self.valid_until
+    }
+}
+// Serialize same-client cache misses. No older response can publish after a newer
+// response; another miss fails promptly instead of queuing unbounded work.
+struct Flight<'a> {
+    ids: &'a StdMutex<HashSet<String>>,
+    id: String,
+}
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut ids) = self.ids.lock() {
+            ids.remove(&self.id);
+        }
     }
 }
 
@@ -181,7 +262,8 @@ pub struct CimdFetcher {
     resolver: Arc<dyn Resolver>,
     transport: Arc<dyn Transport>,
     concurrency: Semaphore,
-    cache: Mutex<HashMap<String, (Instant, Arc<ClientMetadataDocument>)>>,
+    cache: Mutex<HashMap<String, Arc<LeasedClientMetadata>>>,
+    in_flight: StdMutex<HashSet<String>>,
 }
 impl Default for CimdFetcher {
     fn default() -> Self {
@@ -198,22 +280,39 @@ impl CimdFetcher {
             }),
             concurrency: Semaphore::new(8),
             cache: Mutex::new(HashMap::new()),
+            in_flight: StdMutex::new(HashSet::new()),
         }
     }
     pub async fn fetch(&self, client_id: &str) -> Result<Arc<ClientMetadataDocument>, CimdError> {
+        Ok(Arc::clone(&self.fetch_leased(client_id).await?.document))
+    }
+    pub async fn fetch_leased(
+        &self,
+        client_id: &str,
+    ) -> Result<Arc<LeasedClientMetadata>, CimdError> {
         let (url, host, port) = validate_client_id(client_id)?;
         {
             let cache = self.cache.lock().await;
-            if let Some((expiry, document)) = cache.get(client_id)
-                && *expiry > Instant::now()
+            if let Some(snapshot) = cache.get(client_id)
+                && snapshot.is_fresh()
             {
-                return Ok(Arc::clone(document));
+                return Ok(Arc::clone(snapshot));
             }
         }
         let _permit = self
             .concurrency
             .try_acquire()
             .map_err(|_| CimdError::Busy)?;
+        {
+            let mut ids = self.in_flight.lock().map_err(|_| CimdError::Busy)?;
+            if !ids.insert(client_id.to_owned()) {
+                return Err(CimdError::Busy);
+            }
+        }
+        let _flight = Flight {
+            ids: &self.in_flight,
+            id: client_id.to_owned(),
+        };
         let (document, ttl) = tokio::time::timeout(REQUEST_TIMEOUT, async {
             let addrs = self.resolver.resolve(host.clone(), port).await?;
             if addrs.is_empty()
@@ -254,21 +353,46 @@ impl CimdFetcher {
         })
         .await
         .map_err(|_| CimdError::FetchFailed)??;
-        let document = Arc::new(document);
-        if let Some(ttl) = ttl {
+        let snapshot = Arc::new(LeasedClientMetadata {
+            document: Arc::new(document),
+            valid_until: Instant::now() + ttl.unwrap_or(NON_CACHEABLE_LEASE),
+        });
+        if ttl.is_some() {
             let mut cache = self.cache.lock().await;
-            cache.retain(|_, (expiry, _)| *expiry > Instant::now());
+            cache.retain(|_, snapshot| snapshot.is_fresh());
             if cache.len() >= MAX_CACHE_ENTRIES
                 && let Some(key) = cache.keys().next().cloned()
             {
                 cache.remove(&key);
             }
-            cache.insert(
-                client_id.to_owned(),
-                (Instant::now() + ttl, Arc::clone(&document)),
-            );
+            cache.insert(client_id.to_owned(), Arc::clone(&snapshot));
         }
-        Ok(document)
+        Ok(snapshot)
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test_document_source(source: Arc<StdMutex<Option<Vec<u8>>>>) -> Self {
+        struct TestResolver;
+        impl Resolver for TestResolver {
+            fn resolve(&self, _: String, port: u16) -> BoxFuture<Vec<SocketAddr>> {
+                Box::pin(async move { Ok(vec![SocketAddr::new("8.8.8.8".parse().unwrap(), port)]) })
+            }
+        }
+        struct TestTransport(Arc<StdMutex<Option<Vec<u8>>>>);
+        impl Transport for TestTransport {
+            fn fetch(&self, _: Url, _: String, _: Vec<SocketAddr>) -> BoxFuture<ResponseDocument> {
+                let body = self.0.lock().unwrap().clone();
+                Box::pin(async move {
+                    Ok(ResponseDocument {
+                        status: StatusCode::OK,
+                        content_type: Some("application/json".into()),
+                        cache_control: Some(vec!["no-store".into()]),
+                        age: 0,
+                        body: body.ok_or(CimdError::FetchFailed)?,
+                    })
+                })
+            }
+        }
+        Self::with_test_io(Arc::new(TestResolver), Arc::new(TestTransport(source)))
     }
     #[cfg(test)]
     fn with_test_io(resolver: Arc<dyn Resolver>, transport: Arc<dyn Transport>) -> Self {
@@ -277,6 +401,7 @@ impl CimdFetcher {
             transport,
             concurrency: Semaphore::new(8),
             cache: Mutex::new(HashMap::new()),
+            in_flight: StdMutex::new(HashSet::new()),
         }
     }
 }
@@ -705,6 +830,110 @@ mod tests {
         assert!(error_fetcher.fetch(ID).await.is_err());
         assert!(error_fetcher.fetch(ID).await.is_err());
         assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn cached_lease_retains_deadline_and_expired_snapshot_cannot_authorize() {
+        let (fetcher, transport) = fetcher(
+            vec![public_addr()],
+            fixture(),
+            StatusCode::OK,
+            Some("max-age=60"),
+        );
+        let first = fetcher.fetch_leased(ID).await.unwrap();
+        let again = fetcher.fetch_leased(ID).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        assert_eq!(first.valid_until, again.valid_until);
+        let expired = Arc::new(LeasedClientMetadata {
+            document: Arc::clone(&first.document),
+            valid_until: Instant::now() - Duration::from_secs(1),
+        });
+        assert!(!expired.is_fresh());
+        fetcher.cache.lock().await.insert(ID.to_owned(), expired);
+        assert!(fetcher.fetch_leased(ID).await.unwrap().is_fresh());
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn non_cacheable_operation_lease_does_not_cache_document() {
+        let (fetcher, transport) = fetcher(
+            vec![public_addr()],
+            fixture(),
+            StatusCode::OK,
+            Some("no-store"),
+        );
+        let before = Instant::now();
+        let first = fetcher.fetch_leased(ID).await.unwrap();
+        assert!(first.is_fresh());
+        assert!(first.valid_until <= Instant::now() + NON_CACHEABLE_LEASE);
+        assert!(first.valid_until >= before + NON_CACHEABLE_LEASE);
+        assert!(fetcher.cache.lock().await.is_empty());
+        let next = fetcher.fetch_leased(ID).await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &next));
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+    }
+    #[test]
+    fn binding_compares_security_fields_and_ignores_cosmetics_and_order() {
+        let original = validate_document(ID, &fixture()).unwrap();
+        let mut changed: serde_json::Value = serde_json::from_slice(&fixture()).unwrap();
+        changed["client_name"] = "New display name".into();
+        changed["redirect_uris"].as_array_mut().unwrap().reverse();
+        changed["logo_uri"] = "https://ignored.example/logo.png".into();
+        let equivalent = validate_document(ID, &serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert_eq!(
+            original.security_binding(false),
+            equivalent.security_binding(false)
+        );
+        changed["redirect_uris"].as_array_mut().unwrap().pop();
+        let removed = validate_document(ID, &serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert_ne!(
+            original.security_binding(false),
+            removed.security_binding(false)
+        );
+        changed["grant_types"] = serde_json::json!(["authorization_code", "refresh_token"]);
+        let refresh = validate_document(ID, &serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert_eq!(
+            removed.security_binding(false),
+            refresh.security_binding(false)
+        );
+        assert_ne!(
+            removed.security_binding(true),
+            refresh.security_binding(true)
+        );
+        let encoded = serde_json::to_vec(&original.security_binding(false)).unwrap();
+        let decoded: CimdSecurityBinding = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, original.security_binding(false));
+    }
+    #[tokio::test]
+    async fn same_client_misses_fail_promptly_and_cancellation_releases_flight() {
+        struct SlowTransport;
+        impl Transport for SlowTransport {
+            fn fetch(&self, _: Url, _: String, _: Vec<SocketAddr>) -> BoxFuture<ResponseDocument> {
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Err(CimdError::FetchFailed)
+                })
+            }
+        }
+        let fetcher = Arc::new(CimdFetcher::with_test_io(
+            Arc::new(FakeResolver(vec![public_addr()])),
+            Arc::new(SlowTransport),
+        ));
+        let task_fetcher = Arc::clone(&fetcher);
+        let task = tokio::spawn(async move { task_fetcher.fetch_leased(ID).await });
+        for _ in 0..100 {
+            if fetcher.in_flight.lock().unwrap().contains(ID) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(fetcher.in_flight.lock().unwrap().contains(ID));
+        assert!(matches!(
+            fetcher.fetch_leased(ID).await,
+            Err(CimdError::Busy)
+        ));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(fetcher.in_flight.lock().unwrap().is_empty());
+        assert_eq!(fetcher.concurrency.available_permits(), 8);
     }
     #[tokio::test]
     async fn blocks_mixed_dns_before_transport() {

@@ -13,6 +13,23 @@ const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 
 #[sqlx::test(migrations = "./migrations")]
 async fn protected_resource_to_jwks_and_refresh_contract(pool: PgPool) {
+    run_resource_contract(pool, false).await;
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn generic_cimd_resource_to_google_consent_jwks_refresh_and_logout(pool: PgPool) {
+    run_resource_contract(pool, true).await;
+}
+async fn run_resource_contract(pool: PgPool, generic: bool) {
+    let client_id = if generic {
+        "https://mcp-client.example.org/metadata.json"
+    } else {
+        "synthetic-mcp"
+    };
+    let redirect = if generic {
+        "https://mcp-client.example.org/oauth/callback"
+    } else {
+        REDIRECT
+    };
     let database_url = std::env::var("DATABASE_URL").unwrap();
     assert_eq!(
         database_url,
@@ -92,7 +109,7 @@ async fn protected_resource_to_jwks_and_refresh_contract(pool: PgPool) {
             FirstPartyClient::new(
                 "synthetic-mcp",
                 "Synthetic MCP client",
-                vec![RegisteredRedirect::new(REDIRECT, RedirectKind::Exact).unwrap()],
+                vec![RegisteredRedirect::new(redirect, RedirectKind::Exact).unwrap()],
                 ["openid", "profile", "email", "offline_access"],
                 [resource],
                 None,
@@ -138,12 +155,34 @@ async fn protected_resource_to_jwks_and_refresh_contract(pool: PgPool) {
         format!("{upstream_origin}/certs"),
         format!("{issuer}/federation/google/callback"),
     );
-    let app = router(AppState::for_test_provider(
-        Database::from_pool(pool, Duration::from_secs(1)),
+    let mut state = AppState::for_test_provider(
+        Database::from_pool(pool.clone(), Duration::from_secs(1)),
         keys,
         registry,
         google,
-    ));
+    );
+    if generic {
+        let provider = Arc::get_mut(&mut state.0)
+            .unwrap()
+            .provider
+            .as_mut()
+            .unwrap();
+        provider.cimd_policy = Some(CimdPolicyConfig {
+            scopes: vec![
+                "openid".into(),
+                "profile".into(),
+                "email".into(),
+                "offline_access".into(),
+            ],
+            resources: vec![resource.into()],
+            allow_refresh: true,
+        });
+        let document = json!({"client_id":client_id,"client_name":"Synthetic public client","redirect_uris":[redirect],"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"]});
+        provider.cimd_fetcher = CimdFetcher::for_test_document_source(Arc::new(Mutex::new(Some(
+            serde_json::to_vec(&document).unwrap(),
+        ))));
+    }
+    let app = router(state);
     let as_path = format!(
         "{}/.well-known/oauth-authorization-server",
         url::Url::parse(issuer)
@@ -159,6 +198,8 @@ async fn protected_resource_to_jwks_and_refresh_contract(pool: PgPool) {
     assert_eq!(metadata_response.status(), StatusCode::OK);
     let metadata: serde_json::Value = serde_json::from_str(&body(metadata_response).await).unwrap();
     assert_eq!(metadata["issuer"], issuer);
+    assert_eq!(metadata["client_id_metadata_document_supported"], generic);
+    assert!(metadata.get("registration_endpoint").is_none());
     assert_eq!(
         metadata["code_challenge_methods_supported"],
         json!(["S256"])
@@ -180,8 +221,8 @@ async fn protected_resource_to_jwks_and_refresh_contract(pool: PgPool) {
         authorize_path.path(),
         form_urlencoded::Serializer::new(String::new())
             .append_pair("response_type", "code")
-            .append_pair("client_id", "synthetic-mcp")
-            .append_pair("redirect_uri", REDIRECT)
+            .append_pair("client_id", client_id)
+            .append_pair("redirect_uri", redirect)
             // offline_access is an extra AS scope for the synthetic refresh
             // check; the protected resource advertises the three scopes above.
             .append_pair("scope", "openid profile email offline_access")
@@ -220,6 +261,27 @@ async fn protected_resource_to_jwks_and_refresh_contract(pool: PgPool) {
     assert_eq!(completed.status(), StatusCode::OK);
     let session_cookie = cookie_value(&completed);
     let html = body(completed).await;
+    if generic {
+        assert!(html.contains(client_id));
+        assert!(html.contains("nombre declarado"));
+    }
+    let silent = app
+        .clone()
+        .oneshot(
+            Request::get(format!("{authorize}&prompt=none"))
+                .header(header::COOKIE, &session_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(silent.status(), StatusCode::SEE_OTHER);
+    assert!(
+        silent.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .contains("error=consent_required")
+    );
     let approval = form_urlencoded::Serializer::new(String::new())
         .append_pair("transaction_id", &form_value(&html, "transaction_id"))
         .append_pair("csrf", &form_value(&html, "csrf"))
@@ -229,7 +291,7 @@ async fn protected_resource_to_jwks_and_refresh_contract(pool: PgPool) {
         .clone()
         .oneshot(
             Request::post("/consent")
-                .header(header::COOKIE, session_cookie)
+                .header(header::COOKIE, &session_cookie)
                 .header(header::ORIGIN, issuer)
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(Body::from(approval))
@@ -243,7 +305,7 @@ async fn protected_resource_to_jwks_and_refresh_contract(pool: PgPool) {
         .unwrap()
         .parse()
         .unwrap();
-    assert_eq!(returned.as_str().split('?').next().unwrap(), REDIRECT);
+    assert_eq!(returned.as_str().split('?').next().unwrap(), redirect);
     let callback_values = returned
         .query_pairs()
         .collect::<std::collections::HashMap<_, _>>();
@@ -253,9 +315,9 @@ async fn protected_resource_to_jwks_and_refresh_contract(pool: PgPool) {
     let token_path = url::Url::parse(metadata["token_endpoint"].as_str().unwrap()).unwrap();
     let exchange = form_urlencoded::Serializer::new(String::new())
         .append_pair("grant_type", "authorization_code")
-        .append_pair("client_id", "synthetic-mcp")
+        .append_pair("client_id", client_id)
         .append_pair("code", &callback_values["code"])
-        .append_pair("redirect_uri", REDIRECT)
+        .append_pair("redirect_uri", redirect)
         .append_pair("code_verifier", VERIFIER)
         .append_pair("resource", resource)
         .finish();
@@ -301,7 +363,7 @@ async fn protected_resource_to_jwks_and_refresh_contract(pool: PgPool) {
     let claims = decode::<serde_json::Value>(access, &decoding_key, &validation)
         .unwrap()
         .claims;
-    assert_eq!(claims["client_id"], "synthetic-mcp");
+    assert_eq!(claims["client_id"], client_id);
     assert!(
         claims["aud"]
             .as_array()
@@ -315,7 +377,7 @@ async fn protected_resource_to_jwks_and_refresh_contract(pool: PgPool) {
     let refresh = issued["refresh_token"].as_str().unwrap();
     let refresh_form = form_urlencoded::Serializer::new(String::new())
         .append_pair("grant_type", "refresh_token")
-        .append_pair("client_id", "synthetic-mcp")
+        .append_pair("client_id", client_id)
         .append_pair("refresh_token", refresh)
         .append_pair("resource", resource)
         .finish();
@@ -359,7 +421,7 @@ async fn protected_resource_to_jwks_and_refresh_contract(pool: PgPool) {
     );
     let successor_form = form_urlencoded::Serializer::new(String::new())
         .append_pair("grant_type", "refresh_token")
-        .append_pair("client_id", "synthetic-mcp")
+        .append_pair("client_id", client_id)
         .append_pair(
             "refresh_token",
             refreshed["refresh_token"].as_str().unwrap(),
@@ -367,6 +429,7 @@ async fn protected_resource_to_jwks_and_refresh_contract(pool: PgPool) {
         .append_pair("resource", resource)
         .finish();
     let revoked = app
+        .clone()
         .oneshot(
             Request::post(token_path.path())
                 .body(Body::from(successor_form))
@@ -375,4 +438,102 @@ async fn protected_resource_to_jwks_and_refresh_contract(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(revoked.status(), StatusCode::BAD_REQUEST);
+    let consent = app
+        .clone()
+        .oneshot(
+            Request::get(&authorize)
+                .header(header::COOKIE, &session_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(consent.status(), StatusCode::OK);
+    let html = body(consent).await;
+    let approval = form_urlencoded::Serializer::new(String::new())
+        .append_pair("transaction_id", &form_value(&html, "transaction_id"))
+        .append_pair("csrf", &form_value(&html, "csrf"))
+        .append_pair("action", "approve")
+        .finish();
+    let approved = app
+        .clone()
+        .oneshot(
+            Request::post("/consent")
+                .header(header::COOKIE, &session_cookie)
+                .header(header::ORIGIN, issuer)
+                .body(Body::from(approval))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), StatusCode::SEE_OTHER);
+    let location: url::Url = approved.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let code = location
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .unwrap()
+        .1
+        .into_owned();
+    let exchange = form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "authorization_code")
+        .append_pair("client_id", client_id)
+        .append_pair("code", &code)
+        .append_pair("redirect_uri", redirect)
+        .append_pair("code_verifier", VERIFIER)
+        .append_pair("resource", resource)
+        .finish();
+    let live = app
+        .clone()
+        .oneshot(Request::post("/token").body(Body::from(exchange)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(live.status(), StatusCode::OK);
+    let live: serde_json::Value = serde_json::from_str(&body(live).await).unwrap();
+    let logout = app
+        .clone()
+        .oneshot(
+            Request::get("/logout")
+                .header(header::COOKIE, &session_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), StatusCode::OK);
+    let html = body(logout).await;
+    let logout_form = form_urlencoded::Serializer::new(String::new())
+        .append_pair("challenge", &form_value(&html, "challenge"))
+        .append_pair("csrf", &form_value(&html, "csrf"))
+        .finish();
+    let ended = app
+        .clone()
+        .oneshot(
+            Request::post("/logout")
+                .header(header::COOKIE, &session_cookie)
+                .header(header::ORIGIN, issuer)
+                .body(Body::from(logout_form))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ended.status(), StatusCode::SEE_OTHER);
+    let refresh_form = form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("client_id", client_id)
+        .append_pair("refresh_token", live["refresh_token"].as_str().unwrap())
+        .append_pair("resource", resource)
+        .finish();
+    let ended_refresh = app
+        .oneshot(
+            Request::post("/token")
+                .body(Body::from(refresh_form))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ended_refresh.status(), StatusCode::BAD_REQUEST);
 }

@@ -1,7 +1,8 @@
 use crate::{
     AuthorizationRequest, BrowserStore, ClientRegistry, Config, ConsentHandle, CredentialStore,
     Database, GoogleAdapter, LogoutChallenge, LogoutStore, ProviderSession, SigningKeys,
-    config::Mode,
+    cimd::CimdFetcher,
+    config::{CimdPolicyConfig, Mode},
     tokens::{self, AccessClaims},
 };
 use axum::{
@@ -24,10 +25,40 @@ use uuid::Uuid;
 pub struct AppState(Arc<Inner>);
 struct Provider {
     registry: ClientRegistry,
+    cimd_policy: Option<CimdPolicyConfig>,
+    cimd_fetcher: CimdFetcher,
     google: GoogleAdapter,
     issuer: String,
     userinfo: String,
     secure: bool,
+}
+impl Provider {
+    async fn resolve_client(&self, client_id: &str) -> Result<ClientRegistry, ()> {
+        if self.registry.contains_client(client_id) {
+            return Ok(self.registry.clone());
+        }
+        let policy = self.cimd_policy.as_ref().ok_or(())?;
+        let snapshot = self
+            .cimd_fetcher
+            .fetch_leased(client_id)
+            .await
+            .map_err(|_| ())?;
+        self.registry
+            .project_cimd(
+                snapshot,
+                &policy.scopes,
+                &policy.resources,
+                policy.allow_refresh,
+            )
+            .map_err(|_| ())
+    }
+    fn advertised_scopes(&self) -> Vec<String> {
+        let mut scopes = self.registry.advertised_scopes();
+        if let Some(policy) = &self.cimd_policy {
+            scopes.extend(policy.advertised_scopes().cloned());
+        }
+        scopes.into_iter().collect()
+    }
 }
 struct Inner {
     database: Database,
@@ -52,6 +83,8 @@ impl AppState {
             let issuer = config.issuer.as_str().trim_end_matches('/').to_owned();
             Some(Provider {
                 registry,
+                cimd_policy: auth.cimd.clone(),
+                cimd_fetcher: CimdFetcher::new(),
                 google: GoogleAdapter::new(
                     &google.client_id,
                     &google.client_secret_env,
@@ -111,6 +144,8 @@ impl AppState {
             keys,
             provider: Some(Provider {
                 registry,
+                cimd_policy: None,
+                cimd_fetcher: CimdFetcher::new(),
                 google,
                 userinfo: format!("{issuer}/userinfo"),
                 issuer,
@@ -220,6 +255,7 @@ struct Metadata {
     request_parameter_supported: bool,
     claims_parameter_supported: bool,
     scopes_supported: Vec<String>,
+    client_id_metadata_document_supported: bool,
 }
 async fn discovery(State(s): State<AppState>) -> Response {
     let p = s.0.provider.as_ref().unwrap();
@@ -241,7 +277,8 @@ async fn discovery(State(s): State<AppState>) -> Response {
         request_uri_parameter_supported: false,
         request_parameter_supported: false,
         claims_parameter_supported: false,
-        scopes_supported: p.registry.advertised_scopes().into_iter().collect(),
+        scopes_supported: p.advertised_scopes(),
+        client_id_metadata_document_supported: p.cimd_policy.is_some(),
     })
 }
 
@@ -268,22 +305,36 @@ async fn authorize(s: AppState, raw: String, headers: HeaderMap) -> Response {
         return local_error("Solicitud inválida");
     };
     let p = s.0.provider.as_ref().unwrap();
-    if !p.registry.trusted_redirect(client, redirect) {
-        return local_error("Cliente o retorno inválido");
+    for attempt in 0..2 {
+        let Ok(registry) = p.resolve_client(client).await else {
+            return local_error("Cliente o retorno inválido");
+        };
+        if !registry.trusted_redirect(client, redirect) {
+            return local_error("Cliente o retorno inválido");
+        }
+        let state = match optional(&q, "state") {
+            Ok(value) => value,
+            Err(_) => return local_error("Solicitud inválida"),
+        };
+        let result = authorize_valid(&s, &q, &headers, &registry).await;
+        if result.is_err() && registry.ensure_fresh().is_err() && attempt == 0 {
+            continue;
+        }
+        return match result {
+            Ok(response) => response,
+            Err(code) if registry.ensure_fresh().is_ok() => {
+                oauth_redirect(redirect, state, &p.issuer, &code)
+            }
+            Err(_) => local_error("La solicitud expiró"),
+        };
     }
-    let state = match optional(&q, "state") {
-        Ok(v) => v,
-        Err(_) => return local_error("Solicitud inválida"),
-    };
-    match authorize_valid(&s, &q, &headers).await {
-        Ok(r) => r,
-        Err(code) => oauth_redirect(redirect, state, &p.issuer, &code),
-    }
+    local_error("La solicitud expiró")
 }
 async fn authorize_valid(
     s: &AppState,
     q: &[(String, String)],
     headers: &HeaderMap,
+    registry: &ClientRegistry,
 ) -> Result<Response, String> {
     let p = s.0.provider.as_ref().unwrap();
     for unsupported in ["request_uri", "request", "claims", "response_mode"] {
@@ -316,8 +367,7 @@ async fn authorize_valid(
                 .ok_or("invalid_request")
         })
         .transpose()?;
-    let pending = p
-        .registry
+    let pending = registry
         .validate_pending(AuthorizationRequest {
             client_id: client,
             redirect_uri: redirect,
@@ -353,7 +403,7 @@ async fn authorize_valid(
             .begin_authenticated(&session, &pending, downstream, nonce)
             .await
             .map_err(|_| "server_error".to_owned())?;
-        return Ok(consent_page(&store, &session, &handle, &p.registry).await);
+        return Ok(consent_page(&store, &session, &handle, p).await);
     }
     if prompt == Some("none") || max_age.is_some() {
         return Err("login_required".into());
@@ -380,7 +430,7 @@ async fn authorize_valid(
         start.browser_binding(),
         if p.secure { "; Secure" } else { "" }
     );
-    let client_name = p.registry.display_name(client).ok_or("server_error")?;
+    let client_name = registry.display_name(client).ok_or("server_error")?;
     let mut r = login_page(
         render_login(
             client_name,
@@ -422,8 +472,27 @@ async fn google_start(State(s): State<AppState>, headers: HeaderMap, body: Bytes
     };
     let store = BrowserStore::new(s.0.database.pool().clone());
     if action == "cancel" {
-        let outcome = store.cancel_google(id, state, binding).await;
-        let Ok(outcome) = outcome else {
+        let Ok(client) = store.transaction_client_id(id).await else {
+            return local_error("La solicitud expiró");
+        };
+        let mut outcome = None;
+        for attempt in 0..2 {
+            let Ok(registry) = p.resolve_client(&client).await else {
+                break;
+            };
+            match store
+                .cancel_google_with_registry(id, state, binding, &registry)
+                .await
+            {
+                Ok(value) => {
+                    outcome = Some(value);
+                    break;
+                }
+                Err(crate::BrowserError::MetadataExpired) if attempt == 0 => continue,
+                Err(_) => break,
+            }
+        }
+        let Some(outcome) = outcome else {
             return local_error("La solicitud expiró");
         };
         let mut response = oauth_redirect(
@@ -490,14 +559,30 @@ async fn callback(
             clear_transaction_cookie(&mut response, consumed_cookie.as_deref(), p.secure);
             return response;
         }
-        let mut response = match store.deny_callback(&claim, &p.registry).await {
-            Ok(v) => oauth_redirect(
+        let mut outcome = None;
+        if let Ok(client) = store.callback_client_id(&claim).await {
+            for attempt in 0..2 {
+                let Ok(registry) = p.resolve_client(&client).await else {
+                    break;
+                };
+                match store.deny_callback(&claim, &registry).await {
+                    Ok(value) => {
+                        outcome = Some(value);
+                        break;
+                    }
+                    Err(crate::BrowserError::MetadataExpired) if attempt == 0 => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+        let mut response = match outcome {
+            Some(v) => oauth_redirect(
                 &v.redirect_uri,
                 v.downstream_state.as_deref(),
                 &p.issuer,
                 "access_denied",
             ),
-            Err(_) => local_error("Respuesta de acceso inválida"),
+            None => local_error("Respuesta de acceso inválida"),
         };
         clear_transaction_cookie(&mut response, consumed_cookie.as_deref(), p.secure);
         return response;
@@ -515,24 +600,36 @@ async fn callback(
             return response;
         }
     };
-    let completion = match store
-        .complete_callback(&claim, &identity, Duration::from_secs(30 * 24 * 3600))
-        .await
-    {
-        Ok(v) => v,
-        Err(_) => {
-            let mut response = local_error("La solicitud expiró");
-            clear_transaction_cookie(&mut response, consumed_cookie.as_deref(), p.secure);
-            return response;
+    let mut completion = None;
+    if let Ok(client) = store.callback_client_id(&claim).await {
+        for attempt in 0..2 {
+            let Ok(registry) = p.resolve_client(&client).await else {
+                break;
+            };
+            match store
+                .complete_callback_with_registry(
+                    &claim,
+                    &identity,
+                    Duration::from_secs(30 * 24 * 3600),
+                    &registry,
+                )
+                .await
+            {
+                Ok(value) => {
+                    completion = Some(value);
+                    break;
+                }
+                Err(crate::BrowserError::MetadataExpired) if attempt == 0 => continue,
+                Err(_) => break,
+            }
         }
+    }
+    let Some(completion) = completion else {
+        let mut response = local_error("La solicitud expiró");
+        clear_transaction_cookie(&mut response, consumed_cookie.as_deref(), p.secure);
+        return response;
     };
-    let mut r = consent_page(
-        &store,
-        &completion.session,
-        &completion.consent,
-        &p.registry,
-    )
-    .await;
+    let mut r = consent_page(&store, &completion.session, &completion.consent, p).await;
     let cookie = format!(
         "{}={}; Path=/; HttpOnly; SameSite=Lax{}",
         session_cookie(p.secure),
@@ -566,7 +663,7 @@ async fn consent_get(
         &BrowserStore::new(s.0.database.pool().clone()),
         &session,
         &ConsentHandle::submitted(id, csrf.into()),
-        &p.registry,
+        p,
     )
     .await
 }
@@ -574,12 +671,22 @@ async fn consent_page(
     store: &BrowserStore,
     session: &ProviderSession,
     handle: &ConsentHandle,
-    registry: &ClientRegistry,
+    provider: &Provider,
 ) -> Response {
-    match store.consent_view(session, handle, registry).await {
-        Ok(v) => form_page(render_consent(&v), &v.redirect_uri),
-        Err(_) => local_error("La solicitud expiró"),
+    let Ok(client) = store.transaction_client_id(handle.transaction_id()).await else {
+        return local_error("La solicitud expiró");
+    };
+    for attempt in 0..2 {
+        let Ok(registry) = provider.resolve_client(&client).await else {
+            return local_error("La solicitud expiró");
+        };
+        match store.consent_view(session, handle, &registry).await {
+            Ok(v) => return form_page(render_consent(&v), &v.redirect_uri),
+            Err(crate::BrowserError::MetadataExpired) if attempt == 0 => continue,
+            Err(_) => return local_error("La solicitud expiró"),
+        }
     }
+    local_error("La solicitud expiró")
 }
 async fn consent_post(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let Ok(q) = pairs_bytes(&body, 4096) else {
@@ -604,27 +711,42 @@ async fn consent_post(State(s): State<AppState>, headers: HeaderMap, body: Bytes
     };
     let h = ConsentHandle::submitted(id, csrf.into());
     let store = BrowserStore::new(s.0.database.pool().clone());
-    match action {
-        "approve" => match store.approve(&session, &h, &p.registry).await {
-            Ok(v) => code_redirect(
-                &v.redirect_uri,
-                v.downstream_state.as_deref(),
-                &p.issuer,
-                v.code.expose(),
-            ),
-            Err(_) => local_error("La solicitud expiró"),
-        },
-        "deny" => match store.deny(&session, &h).await {
-            Ok(v) => oauth_redirect(
-                &v.redirect_uri,
-                v.downstream_state.as_deref(),
-                &p.issuer,
-                "access_denied",
-            ),
-            Err(_) => local_error("La solicitud expiró"),
-        },
-        _ => local_error("Solicitud inválida"),
+    let Ok(client) = store.transaction_client_id(id).await else {
+        return local_error("La solicitud expiró");
+    };
+    for attempt in 0..2 {
+        let Ok(registry) = p.resolve_client(&client).await else {
+            return local_error("La solicitud expiró");
+        };
+        match action {
+            "approve" => match store.approve(&session, &h, &registry).await {
+                Ok(v) => {
+                    return code_redirect(
+                        &v.redirect_uri,
+                        v.downstream_state.as_deref(),
+                        &p.issuer,
+                        v.code.expose(),
+                    );
+                }
+                Err(crate::BrowserError::MetadataExpired) if attempt == 0 => continue,
+                Err(_) => return local_error("La solicitud expiró"),
+            },
+            "deny" => match store.deny_with_registry(&session, &h, &registry).await {
+                Ok(v) => {
+                    return oauth_redirect(
+                        &v.redirect_uri,
+                        v.downstream_state.as_deref(),
+                        &p.issuer,
+                        "access_denied",
+                    );
+                }
+                Err(crate::BrowserError::MetadataExpired) if attempt == 0 => continue,
+                Err(_) => return local_error("La solicitud expiró"),
+            },
+            _ => return local_error("Solicitud inválida"),
+        }
     }
+    local_error("La solicitud expiró")
 }
 
 async fn token(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -653,38 +775,49 @@ async fn token(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Re
         Err(_) => return token_error("invalid_request"),
     };
     let store = CredentialStore::new(s.0.database.pool().clone());
-    let result = match one(&q, "grant_type") {
-        Some("authorization_code") => {
-            let (Some(code), Some(redirect), Some(verifier)) = (
-                one(&q, "code"),
-                one(&q, "redirect_uri"),
-                one(&q, "code_verifier"),
-            ) else {
-                return token_error("invalid_request");
-            };
-            store
-                .exchange_code_request(
-                    code,
-                    client,
-                    redirect,
-                    resource,
-                    verifier,
-                    scope.as_deref(),
-                    &p.registry,
-                )
-                .await
-                .map(|v| (v, true))
+    let mut attempt = 0;
+    let result = loop {
+        let Ok(registry) = p.resolve_client(client).await else {
+            return token_error("invalid_grant");
+        };
+        let result = match one(&q, "grant_type") {
+            Some("authorization_code") => {
+                let (Some(code), Some(redirect), Some(verifier)) = (
+                    one(&q, "code"),
+                    one(&q, "redirect_uri"),
+                    one(&q, "code_verifier"),
+                ) else {
+                    return token_error("invalid_request");
+                };
+                store
+                    .exchange_code_request(
+                        code,
+                        client,
+                        redirect,
+                        resource,
+                        verifier,
+                        scope.as_deref(),
+                        &registry,
+                    )
+                    .await
+                    .map(|v| (v, true))
+            }
+            Some("refresh_token") => {
+                let Some(refresh) = one(&q, "refresh_token") else {
+                    return token_error("invalid_request");
+                };
+                store
+                    .rotate_refresh_request(refresh, client, resource, scope.as_deref(), &registry)
+                    .await
+                    .map(|v| (v, false))
+            }
+            _ => return token_error("unsupported_grant_type"),
+        };
+        if matches!(&result, Err(crate::CredentialError::MetadataExpired)) && attempt == 0 {
+            attempt += 1;
+            continue;
         }
-        Some("refresh_token") => {
-            let Some(refresh) = one(&q, "refresh_token") else {
-                return token_error("invalid_request");
-            };
-            store
-                .rotate_refresh_request(refresh, client, resource, scope.as_deref(), &p.registry)
-                .await
-                .map(|v| (v, false))
-        }
-        _ => return token_error("unsupported_grant_type"),
+        break result;
     };
     let mut response = match result {
         Ok((v, initial)) => match tokens::issue(&s.0.keys, &p.issuer, &p.userinfo, v, initial) {
@@ -1322,6 +1455,8 @@ const CSS: &str = "*{box-sizing:border-box}html{background:#111918;color:#f1f2e9
 
 #[cfg(test)]
 mod tests {
+    #[path = "cimd_security.rs"]
+    mod cimd_security;
     #[path = "mcp_compatibility.rs"]
     mod mcp_compatibility;
 

@@ -1,6 +1,8 @@
+use crate::cimd::{CimdSecurityBinding, LeasedClientMetadata};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use url::Url;
@@ -30,6 +32,12 @@ pub struct FirstPartyClient {
 pub struct ClientRegistry {
     clients: HashMap<String, FirstPartyClient>,
     userinfo_resource: Option<String>,
+    dynamic: Option<ResolvedCimdPolicy>,
+}
+#[derive(Clone, Debug)]
+struct ResolvedCimdPolicy {
+    snapshot: Arc<LeasedClientMetadata>,
+    binding: CimdSecurityBinding,
 }
 #[derive(Clone, Debug)]
 pub struct AuthorizationRequest<'a> {
@@ -48,6 +56,7 @@ pub struct PendingAuthorizationGrant {
     scopes: Vec<String>,
     resource: String,
     code_challenge: String,
+    dynamic: Option<ResolvedCimdPolicy>,
 }
 #[derive(Clone, Debug)]
 pub struct ValidatedAuthorizationGrant {
@@ -57,10 +66,13 @@ pub struct ValidatedAuthorizationGrant {
     resource: String,
     code_challenge: String,
     issue_refresh_token: bool,
+    dynamic: Option<ResolvedCimdPolicy>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum OAuthError {
+    #[error("client metadata operation lease expired")]
+    MetadataExpired,
     #[error("invalid client declaration")]
     InvalidClientDeclaration,
     #[error("unknown client")]
@@ -191,7 +203,105 @@ impl ClientRegistry {
         Ok(Self {
             clients: map,
             userinfo_resource,
+            dynamic: None,
         })
+    }
+    pub fn contains_client(&self, client_id: &str) -> bool {
+        self.clients.contains_key(client_id)
+    }
+    /// Request-local projection; the shared first-party registry is never modified.
+    pub fn project_cimd(
+        &self,
+        snapshot: Arc<LeasedClientMetadata>,
+        scopes: &[String],
+        resources: &[String],
+        allow_refresh: bool,
+    ) -> Result<Self, OAuthError> {
+        let doc = snapshot.document();
+        if self.contains_client(doc.client_id())
+            || !snapshot.is_fresh()
+            || scopes.is_empty()
+            || resources.is_empty()
+        {
+            return Err(OAuthError::InvalidClientDeclaration);
+        }
+        let effective_refresh = allow_refresh && doc.refresh_allowed();
+        let scopes = scopes
+            .iter()
+            .filter(|s| effective_refresh || s.as_str() != "offline_access")
+            .cloned()
+            .collect::<Vec<_>>();
+        let redirects = doc
+            .redirect_uris()
+            .iter()
+            .map(|uri| {
+                RegisteredRedirect::new(
+                    uri.clone(),
+                    if uri.starts_with("http://") {
+                        RedirectKind::NativeLoopback
+                    } else {
+                        RedirectKind::Exact
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let client = FirstPartyClient::new(
+            doc.client_id(),
+            format!(
+                "{} · nombre declarado: {}",
+                doc.client_id(),
+                doc.client_name()
+            ),
+            redirects,
+            scopes,
+            resources.iter().cloned(),
+            None,
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+        )?;
+        let binding = doc.security_binding(allow_refresh);
+        let mut projected = self.clone();
+        projected.clients.insert(client.id.clone(), client);
+        projected.dynamic = Some(ResolvedCimdPolicy { snapshot, binding });
+        Ok(projected)
+    }
+    pub(crate) fn ensure_fresh(&self) -> Result<(), OAuthError> {
+        if self
+            .dynamic
+            .as_ref()
+            .is_some_and(|d| !d.snapshot.is_fresh())
+        {
+            Err(OAuthError::MetadataExpired)
+        } else {
+            Ok(())
+        }
+    }
+    pub(crate) fn validate_binding(
+        &self,
+        client_id: &str,
+        stored: Option<&str>,
+    ) -> Result<(), OAuthError> {
+        self.ensure_fresh()?;
+        if !self.contains_client(client_id) {
+            return Err(OAuthError::UnknownClient);
+        }
+        let dynamic = self
+            .dynamic
+            .as_ref()
+            .filter(|d| d.snapshot.document().client_id() == client_id);
+        match (dynamic, stored) {
+            (None, None) => Ok(()),
+            (Some(current), Some(stored)) => {
+                let binding: CimdSecurityBinding = serde_json::from_str(stored)
+                    .map_err(|_| OAuthError::InvalidClientDeclaration)?;
+                if binding == current.binding {
+                    Ok(())
+                } else {
+                    Err(OAuthError::InvalidClientDeclaration)
+                }
+            }
+            _ => Err(OAuthError::InvalidClientDeclaration),
+        }
     }
     pub fn trusted_redirect(&self, client_id: &str, uri: &str) -> bool {
         self.clients
@@ -236,6 +346,14 @@ impl ClientRegistry {
             return false;
         };
         let requested = scopes.iter().cloned().collect::<BTreeSet<_>>();
+        if self
+            .dynamic
+            .as_ref()
+            .is_some_and(|d| d.snapshot.document().client_id() == client_id)
+            && !client.resources.contains(resource)
+        {
+            return false;
+        }
         requested.len() == scopes.len()
             && requested.is_subset(&client.scopes)
             && (client.resources.contains(resource)
@@ -267,6 +385,15 @@ impl ClientRegistry {
         scopes: &[&str],
         resource: Option<&str>,
     ) -> Result<PendingAuthorizationGrant, OAuthError> {
+        self.ensure_fresh()?;
+        if self
+            .dynamic
+            .as_ref()
+            .is_some_and(|d| d.snapshot.document().client_id() == client_id)
+            && resource.is_none()
+        {
+            return Err(OAuthError::InvalidResource);
+        }
         let client = self
             .clients
             .get(client_id)
@@ -306,6 +433,14 @@ impl ClientRegistry {
                     .flatten()
             })
             .ok_or(OAuthError::InvalidResource)?;
+        if self
+            .dynamic
+            .as_ref()
+            .is_some_and(|d| d.snapshot.document().client_id() == client_id)
+            && !client.resources.contains(&resource)
+        {
+            return Err(OAuthError::InvalidResource);
+        }
         if !(client.resources.contains(&resource)
             || requested.contains("openid")
                 && self.userinfo_resource.as_deref() == Some(resource.as_str()))
@@ -318,6 +453,11 @@ impl ClientRegistry {
             scopes: requested.into_iter().collect(),
             resource,
             code_challenge: challenge.into(),
+            dynamic: self
+                .dynamic
+                .as_ref()
+                .filter(|d| d.snapshot.document().client_id() == client_id)
+                .cloned(),
         })
     }
     pub fn revalidate_pending(
@@ -338,6 +478,23 @@ impl ClientRegistry {
 }
 
 impl PendingAuthorizationGrant {
+    pub(crate) fn cimd_binding_json(&self) -> Option<String> {
+        self.dynamic.as_ref().map(|d| {
+            serde_json::to_string(&d.binding).expect("binding serialization is infallible")
+        })
+    }
+    pub(crate) fn ensure_fresh(&self) -> Result<(), OAuthError> {
+        if self
+            .dynamic
+            .as_ref()
+            .is_some_and(|d| !d.snapshot.is_fresh())
+        {
+            Err(OAuthError::MetadataExpired)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn client_id(&self) -> &str {
         &self.client_id
     }
@@ -354,6 +511,7 @@ impl PendingAuthorizationGrant {
         &self.code_challenge
     }
     pub(crate) fn approve(self, consent: bool) -> Result<ValidatedAuthorizationGrant, OAuthError> {
+        self.ensure_fresh()?;
         let refresh = self.scopes.iter().any(|s| s == "offline_access");
         if refresh && !consent {
             return Err(OAuthError::ConsentRequired);
@@ -365,10 +523,28 @@ impl PendingAuthorizationGrant {
             resource: self.resource,
             code_challenge: self.code_challenge,
             issue_refresh_token: refresh,
+            dynamic: self.dynamic,
         })
     }
 }
 impl ValidatedAuthorizationGrant {
+    pub(crate) fn cimd_binding_json(&self) -> Option<String> {
+        self.dynamic.as_ref().map(|d| {
+            serde_json::to_string(&d.binding).expect("binding serialization is infallible")
+        })
+    }
+    pub(crate) fn ensure_fresh(&self) -> Result<(), OAuthError> {
+        if self
+            .dynamic
+            .as_ref()
+            .is_some_and(|d| !d.snapshot.is_fresh())
+        {
+            Err(OAuthError::MetadataExpired)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn client_id(&self) -> &str {
         &self.client_id
     }

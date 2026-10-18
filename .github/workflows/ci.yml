@@ -42,6 +42,8 @@ jobs:
           components: rustfmt, clippy
       - run: make lint
       - run: make test
+        env:
+          ERI_PROVIDER_PROOF_CONTAINER: ${{ job.services.postgres.id }}
       - run: make build
       - name: Package identified binary
         run: |

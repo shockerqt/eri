@@ -1,11 +1,11 @@
-.PHONY: dev test test-oauth-smoke test-rss build lint check
+.PHONY: dev test test-oauth-smoke test-rss test-provider-proof build lint check
 
 CONFIG ?= config/eri.toml
 
 dev:
 	cargo run --locked -- --config "$(CONFIG)"
 
-test: test-oauth-smoke test-rss
+test: test-oauth-smoke test-rss test-provider-proof
 	cargo test --locked
 
 test-oauth-smoke:
@@ -13,6 +13,9 @@ test-oauth-smoke:
 
 test-rss:
 	node --test scripts/staging-rss.test.mjs
+
+test-provider-proof:
+	python3 scripts/provider-logout-proof.test.py
 
 build:
 	cargo build --locked --release

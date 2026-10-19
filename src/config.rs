@@ -1,4 +1,6 @@
-use crate::oauth::{ClientRegistry, FirstPartyClient, RedirectKind, RegisteredRedirect};
+use crate::oauth::{
+    AuthorizationFlow, ClientRegistry, FirstPartyClient, RedirectKind, RegisteredRedirect,
+};
 use serde::Deserialize;
 use std::{
     fs,
@@ -98,6 +100,15 @@ pub struct ClientDeclaration {
     pub browser_origins: Vec<String>,
     #[serde(default)]
     pub post_logout_redirects: Vec<String>,
+    #[serde(default)]
+    pub authorization_flow: ConfiguredAuthorizationFlow,
+}
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfiguredAuthorizationFlow {
+    #[default]
+    Interactive,
+    GooglePreauthorized,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -110,6 +121,7 @@ pub struct RedirectDeclaration {
 pub enum ConfiguredRedirectKind {
     Exact,
     NativeLoopback,
+    AppClaimedHttps,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -239,12 +251,15 @@ impl Config {
                                         ConfiguredRedirectKind::NativeLoopback => {
                                             RedirectKind::NativeLoopback
                                         }
+                                        ConfiguredRedirectKind::AppClaimedHttps => {
+                                            RedirectKind::AppClaimedHttps
+                                        }
                                     },
                                 )
                             })
                             .collect::<Result<Vec<_>, _>>()
                             .map_err(|_| invalid("authorization client redirect is invalid"))?;
-                        FirstPartyClient::new(
+                        FirstPartyClient::with_authorization_flow(
                             c.id.clone(),
                             c.display_name.clone(),
                             redirects,
@@ -253,6 +268,14 @@ impl Config {
                             c.default_resource.clone(),
                             c.browser_origins.clone(),
                             c.post_logout_redirects.clone(),
+                            match c.authorization_flow {
+                                ConfiguredAuthorizationFlow::Interactive => {
+                                    AuthorizationFlow::Interactive
+                                }
+                                ConfiguredAuthorizationFlow::GooglePreauthorized => {
+                                    AuthorizationFlow::GooglePreauthorized
+                                }
+                            },
                         )
                         .map_err(|_| invalid("authorization client is invalid"))
                     })
@@ -423,6 +446,7 @@ mod tests {
                 default_resource: None,
                 browser_origins: vec!["https://app.example".into()],
                 post_logout_redirects: vec!["https://app.example/signed-out".into()],
+                authorization_flow: ConfiguredAuthorizationFlow::Interactive,
             }],
         });
         value.validate().unwrap();
@@ -444,6 +468,37 @@ mod tests {
             clients: vec![],
         });
         assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn authorization_flow_is_explicit_and_strict() {
+        let base = "id='web'\ndisplay_name='Web'\nscopes=['openid']\nresources=['https://api.example/resource']\nredirects=[{uri='https://app.example/callback',kind='exact'}]";
+        let default: ClientDeclaration = toml::from_str(base).unwrap();
+        assert!(matches!(
+            default.authorization_flow,
+            ConfiguredAuthorizationFlow::Interactive
+        ));
+        let trusted: ClientDeclaration = toml::from_str(&format!(
+            "{base}\nauthorization_flow='google_preauthorized'"
+        ))
+        .unwrap();
+        assert!(matches!(
+            trusted.authorization_flow,
+            ConfiguredAuthorizationFlow::GooglePreauthorized
+        ));
+        let claimed: ClientDeclaration =
+            toml::from_str(&base.replace("kind='exact'", "kind='app_claimed_https'")).unwrap();
+        assert!(matches!(
+            claimed.redirects[0].kind,
+            ConfiguredRedirectKind::AppClaimedHttps
+        ));
+        assert!(
+            toml::from_str::<ClientDeclaration>(&format!("{base}\nauthorization_flow='other'"))
+                .is_err()
+        );
+        assert!(
+            toml::from_str::<ClientDeclaration>(&format!("{base}\npreauthorized=true")).is_err()
+        );
     }
 
     #[test]

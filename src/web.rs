@@ -378,6 +378,7 @@ async fn authorize_valid(
             resource,
         })
         .map_err(|_| "invalid_request".to_owned())?;
+    let allow_pre_authorization = prompt != Some("consent") && registry.pre_authorizes(&pending);
     let session = session_from(headers, &s.0.database, p.secure).await;
     if prompt == Some("login") {
         return Err("login_required".into());
@@ -395,14 +396,37 @@ async fn authorize_valid(
                 return Err("login_required".into());
             }
         }
-        if prompt == Some("none") {
+        if prompt == Some("none") && !allow_pre_authorization {
             return Err("consent_required".into());
         }
         let store = BrowserStore::new(s.0.database.pool().clone());
         let handle = store
-            .begin_authenticated(&session, &pending, downstream, nonce)
+            .begin_authenticated_with_pre_authorization(
+                &session,
+                &pending,
+                downstream,
+                nonce,
+                allow_pre_authorization,
+            )
             .await
             .map_err(|_| "server_error".to_owned())?;
+        if allow_pre_authorization {
+            let outcome = store
+                .approve_pre_authorized(&session, &handle, registry)
+                .await
+                .map_err(|_| "server_error".to_owned())?;
+            if let Some(outcome) = outcome {
+                return Ok(code_redirect(
+                    &outcome.redirect_uri,
+                    outcome.downstream_state.as_deref(),
+                    &p.issuer,
+                    outcome.code.expose(),
+                ));
+            }
+            if prompt == Some("none") {
+                return Err("consent_required".into());
+            }
+        }
         return Ok(consent_page(&store, &session, &handle, p).await);
     }
     if prompt == Some("none") || max_age.is_some() {
@@ -412,9 +436,19 @@ async fn authorize_valid(
         return Err("temporarily_unavailable".into());
     }
     let start = BrowserStore::new(s.0.database.pool().clone())
-        .begin_google(&pending, downstream, nonce)
+        .begin_google_with_pre_authorization(&pending, downstream, nonce, allow_pre_authorization)
         .await
         .map_err(|_| "server_error".to_owned())?;
+    if allow_pre_authorization {
+        BrowserStore::new(s.0.database.pool().clone())
+            .start_google(
+                start.transaction_id(),
+                start.upstream_state(),
+                start.browser_binding(),
+            )
+            .await
+            .map_err(|_| "server_error".to_owned())?;
+    }
     let upstream = p
         .google
         .authorization_url(
@@ -431,17 +465,21 @@ async fn authorize_valid(
         if p.secure { "; Secure" } else { "" }
     );
     let client_name = registry.display_name(client).ok_or("server_error")?;
-    let mut r = login_page(
-        render_login(
-            client_name,
-            pending.scopes(),
-            pending.resource(),
-            start.transaction_id(),
-            start.upstream_state(),
-        ),
-        upstream.as_str(),
-        pending.redirect_uri(),
-    );
+    let mut r = if allow_pre_authorization {
+        sensitive(Redirect::to(upstream.as_str()).into_response())
+    } else {
+        login_page(
+            render_login(
+                client_name,
+                pending.scopes(),
+                pending.resource(),
+                start.transaction_id(),
+                start.upstream_state(),
+            ),
+            upstream.as_str(),
+            pending.redirect_uri(),
+        )
+    };
     r.headers_mut()
         .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
     Ok(sensitive(r))
@@ -629,7 +667,42 @@ async fn callback(
         clear_transaction_cookie(&mut response, consumed_cookie.as_deref(), p.secure);
         return response;
     };
-    let mut r = consent_page(&store, &completion.session, &completion.consent, p).await;
+    let mut r = None;
+    if let Ok(client) = store
+        .transaction_client_id(completion.consent.transaction_id())
+        .await
+    {
+        for attempt in 0..2 {
+            let Ok(registry) = p.resolve_client(&client).await else {
+                break;
+            };
+            match store
+                .approve_pre_authorized(&completion.session, &completion.consent, &registry)
+                .await
+            {
+                Ok(Some(outcome)) => {
+                    r = Some(code_redirect(
+                        &outcome.redirect_uri,
+                        outcome.downstream_state.as_deref(),
+                        &p.issuer,
+                        outcome.code.expose(),
+                    ));
+                    break;
+                }
+                Ok(None) => break,
+                Err(crate::BrowserError::MetadataExpired) if attempt == 0 => continue,
+                Err(_) => {
+                    let mut response = local_error("La solicitud expiró");
+                    clear_transaction_cookie(&mut response, consumed_cookie.as_deref(), p.secure);
+                    return response;
+                }
+            }
+        }
+    }
+    let mut r = match r {
+        Some(r) => r,
+        None => consent_page(&store, &completion.session, &completion.consent, p).await,
+    };
     let cookie = format!(
         "{}={}; Path=/; HttpOnly; SameSite=Lax{}",
         session_cookie(p.secure),
@@ -1461,7 +1534,10 @@ mod tests {
     mod mcp_compatibility;
 
     use super::*;
-    use crate::{FirstPartyClient, RedirectKind, RegisteredRedirect, config::DatabaseConfig};
+    use crate::{
+        AuthorizationFlow, FirstPartyClient, RedirectKind, RegisteredRedirect,
+        config::DatabaseConfig,
+    };
     use axum::{body::Body, extract::Query, http::Request};
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use http_body_util::BodyExt;
@@ -1527,6 +1603,32 @@ mod tests {
                     None,
                     ["https://app.example"],
                     ["https://app.example/signed-out"],
+                )
+                .unwrap(),
+            ],
+            &"http://127.0.0.1:18082/".parse().unwrap(),
+        )
+        .unwrap()
+    }
+    fn trusted_registry() -> ClientRegistry {
+        ClientRegistry::with_issuer(
+            vec![
+                FirstPartyClient::with_authorization_flow(
+                    "web",
+                    "Balance",
+                    vec![
+                        RegisteredRedirect::new(
+                            "https://app.example/callback?fixed=%2F",
+                            RedirectKind::AppClaimedHttps,
+                        )
+                        .unwrap(),
+                    ],
+                    ["openid", "profile", "email", "offline_access"],
+                    ["https://api.example/resource"],
+                    None,
+                    ["https://app.example"],
+                    ["https://app.example/signed-out"],
+                    AuthorizationFlow::GooglePreauthorized,
                 )
                 .unwrap(),
             ],
@@ -1714,7 +1816,7 @@ mod tests {
             callback,
         );
         let eri = router(AppState::for_test_provider_at(
-            Database::from_pool(pool, Duration::from_secs(1)),
+            Database::from_pool(pool.clone(), Duration::from_secs(1)),
             keys,
             browser_registry(&client_origin, &eri_origin),
             google,
@@ -1759,7 +1861,7 @@ mod tests {
         let token_nonce = nonce.clone();
         let fail_exchange = Arc::new(AtomicBool::new(false));
         let token_failure = fail_exchange.clone();
-        let upstream=Router::new().route("/token",post(move||{let nonce=token_nonce.lock().unwrap().clone();let fail=token_failure.swap(false,Ordering::SeqCst);async move{if fail{return StatusCode::BAD_GATEWAY.into_response()}let now=Utc::now().timestamp();let claims=json!({"iss":"https://accounts.google.com","sub":"signed-subject","aud":"client-1","exp":now+300,"iat":now,"nonce":nonce,"name":"Persona","email":"person@example.test","email_verified":true,"auth_time":now-10});let mut h=Header::new(Algorithm::RS256);h.kid=Some("google".into());h.typ=Some("JWT".into());let token=jsonwebtoken::encode(&h,&claims,&EncodingKey::from_rsa_pem(&fixture("active-private.pem")).unwrap()).unwrap();axum::Json(json!({"id_token":token})).into_response()}})).route("/certs",get(move||{let jwks=jwks.clone();async move{axum::Json(jwks)}}));
+        let upstream=Router::new().route("/token",post(move||{let nonce=token_nonce.lock().unwrap().clone();let fail=token_failure.swap(false,Ordering::SeqCst);async move{if fail{return StatusCode::BAD_GATEWAY.into_response()}let now=Utc::now().timestamp();let claims=json!({"iss":"https://accounts.google.com","sub":"signed-subject","aud":"client-1","exp":now+300,"iat":now,"nonce":nonce,"name":"Persona","email":"person@example.test","email_verified":true,"auth_time":now-10});let mut h=Header::new(Algorithm::RS256);h.kid=Some("google".into());h.typ=Some("JWT".into());let token=jsonwebtoken::encode(&h,&claims,&EncodingKey::from_rsa_pem(&fixture("active-private.pem")).unwrap()).unwrap();axum::Json(json!({"id_token":token})).into_response()}})).route("/certs",get(move||{let jwks=jwks.clone();async move{([(header::CACHE_CONTROL, "max-age=60")], axum::Json(jwks))}}));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
@@ -1779,8 +1881,15 @@ mod tests {
             google.clone(),
             true,
         ));
+        let (_trusted_dir, trusted_keys) = signing_keys();
+        let trusted_app = router(AppState::for_test_provider(
+            Database::from_pool(pool.clone(), Duration::from_secs(1)),
+            trusted_keys,
+            trusted_registry(),
+            google.clone(),
+        ));
         let state = AppState::for_test_provider(
-            Database::from_pool(pool, Duration::from_secs(1)),
+            Database::from_pool(pool.clone(), Duration::from_secs(1)),
             keys,
             registry(),
             google,
@@ -2160,6 +2269,328 @@ mod tests {
                 .contains("form-action 'self' https://app.example")
         );
         let session_cookie = cookie_value(&completed);
+        let direct = trusted_app
+            .clone()
+            .oneshot(Request::get(authorize).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(direct.status(), StatusCode::SEE_OTHER);
+        let direct_cookie = cookie_value(&direct);
+        let google_url: url::Url = direct.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let params = google_url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        *nonce.lock().unwrap() = params["nonce"].to_string();
+        let callback_uri = format!(
+            "/federation/google/callback?state={}&code=synthetic",
+            params["state"]
+        );
+        let direct_callback = trusted_app
+            .clone()
+            .oneshot(
+                Request::get(&callback_uri)
+                    .header(header::COOKIE, &direct_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(direct_callback.status(), StatusCode::SEE_OTHER);
+        let direct_session_cookie = direct_callback
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .filter(|value| value.starts_with("eri_dev_session="))
+            })
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let direct_returned: url::Url = direct_callback.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            direct_returned
+                .query_pairs()
+                .find(|(k, _)| k == "state")
+                .unwrap()
+                .1,
+            "downstream"
+        );
+        let direct_code = direct_returned
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .unwrap()
+            .1
+            .into_owned();
+        let replay_callback = trusted_app
+            .clone()
+            .oneshot(
+                Request::get(&callback_uri)
+                    .header(header::COOKIE, &direct_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay_callback.status(), StatusCode::BAD_REQUEST);
+        let exchange = |verifier: &str| {
+            form_urlencoded::Serializer::new(String::new())
+                .append_pair("grant_type", "authorization_code")
+                .append_pair("client_id", "web")
+                .append_pair("code", &direct_code)
+                .append_pair("redirect_uri", "https://app.example/callback?fixed=%2F")
+                .append_pair("code_verifier", verifier)
+                .finish()
+        };
+        let wrong_pkce = trusted_app
+            .clone()
+            .oneshot(
+                Request::post("/token")
+                    .body(Body::from(exchange("wrong-verifier")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_pkce.status(), StatusCode::BAD_REQUEST);
+        let exchanged = trusted_app
+            .clone()
+            .oneshot(
+                Request::post("/token")
+                    .body(Body::from(exchange(
+                        "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exchanged.status(), StatusCode::OK);
+        let direct_tokens: serde_json::Value =
+            serde_json::from_str(&body(exchanged).await).unwrap();
+        assert!(direct_tokens["refresh_token"].is_string());
+        let direct_refresh = form_urlencoded::Serializer::new(String::new())
+            .append_pair("grant_type", "refresh_token")
+            .append_pair("client_id", "web")
+            .append_pair(
+                "refresh_token",
+                direct_tokens["refresh_token"].as_str().unwrap(),
+            )
+            .finish();
+        let refreshed_direct = trusted_app
+            .clone()
+            .oneshot(
+                Request::post("/token")
+                    .body(Body::from(direct_refresh.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refreshed_direct.status(), StatusCode::OK);
+        let replay_refresh = trusted_app
+            .clone()
+            .oneshot(
+                Request::post("/token")
+                    .body(Body::from(direct_refresh))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay_refresh.status(), StatusCode::BAD_REQUEST);
+        let replay_code = trusted_app
+            .clone()
+            .oneshot(
+                Request::post("/token")
+                    .body(Body::from(exchange(
+                        "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay_code.status(), StatusCode::BAD_REQUEST);
+        let silent_direct = trusted_app
+            .clone()
+            .oneshot(
+                Request::get(format!("{authorize}&prompt=none"))
+                    .header(header::COOKIE, &direct_session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(silent_direct.status(), StatusCode::SEE_OTHER);
+        assert!(
+            silent_direct.headers()[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .contains("code=")
+        );
+        let implicit_userinfo = authorize.replace(
+            "https%3A%2F%2Fapi.example%2Fresource",
+            "http%3A%2F%2F127.0.0.1%3A18082%2Fuserinfo",
+        );
+        let silent_userinfo = trusted_app
+            .clone()
+            .oneshot(
+                Request::get(format!("{implicit_userinfo}&prompt=none"))
+                    .header(header::COOKIE, &direct_session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            silent_userinfo.headers()[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .contains("error=consent_required")
+        );
+        let forced_direct = trusted_app
+            .clone()
+            .oneshot(
+                Request::get(format!("{authorize}&prompt=consent"))
+                    .header(header::COOKIE, &direct_session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forced_direct.status(), StatusCode::OK);
+        assert!(body(forced_direct).await.contains("Autorizar"));
+        let forced_start =
+            begin_test_google(&trusted_app, &format!("{authorize}&prompt=consent")).await;
+        let forced_cookie = cookie_value(&forced_start);
+        let forced_url: url::Url = forced_start.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let forced_query = forced_url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        *nonce.lock().unwrap() = forced_query["nonce"].to_string();
+        let forced_callback = trusted_app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/federation/google/callback?state={}&code=synthetic",
+                    forced_query["state"]
+                ))
+                .header(header::COOKIE, forced_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forced_callback.status(), StatusCode::OK);
+        let forced_html = body(forced_callback).await;
+        assert!(forced_html.contains("Autorizar"));
+        let forced_id: Uuid = form_value(&forced_html, "transaction_id").parse().unwrap();
+        let forced_flag: bool = sqlx::query_scalar(
+            "SELECT allow_pre_authorization FROM browser_authorizations WHERE id=$1",
+        )
+        .bind(forced_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!forced_flag);
+        let policy_change_start = trusted_app
+            .clone()
+            .oneshot(Request::get(authorize).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(policy_change_start.status(), StatusCode::SEE_OTHER);
+        let policy_change_cookie = cookie_value(&policy_change_start);
+        let policy_change_url: url::Url = policy_change_start.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let policy_change_query = policy_change_url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        *nonce.lock().unwrap() = policy_change_query["nonce"].to_string();
+        let policy_change_callback = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/federation/google/callback?state={}&code=synthetic",
+                    policy_change_query["state"]
+                ))
+                .header(header::COOKIE, policy_change_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(policy_change_callback.status(), StatusCode::OK);
+        assert!(body(policy_change_callback).await.contains("Autorizar"));
+        let test_db = Database::from_pool(pool.clone(), Duration::from_secs(1));
+        let legacy_id: Uuid = sqlx::query_scalar("INSERT INTO browser_authorizations(id,stage,client_id,redirect_uri,scopes,resource,code_challenge,created_at,expires_at) VALUES($1,'failed','web','https://app.example/callback',ARRAY['openid'],'https://api.example/resource','challenge',clock_timestamp(),clock_timestamp()+interval '1 minute') RETURNING id")
+            .bind(Uuid::new_v4()).fetch_one(&pool).await.unwrap();
+        let legacy_flag: bool = sqlx::query_scalar(
+            "SELECT allow_pre_authorization FROM browser_authorizations WHERE id=$1",
+        )
+        .bind(legacy_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!legacy_flag);
+        let mut session_headers = HeaderMap::new();
+        session_headers.insert(header::COOKIE, direct_session_cookie.parse().unwrap());
+        let test_session = session_from(&session_headers, &test_db, false)
+            .await
+            .unwrap();
+        let current = trusted_registry();
+        let pending = current
+            .validate_pending(AuthorizationRequest {
+                client_id: "web",
+                redirect_uri: "https://app.example/callback?fixed=%2F",
+                response_type: "code",
+                code_challenge_method: "S256",
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                scopes: &["openid", "offline_access"],
+                resource: Some("https://api.example/resource"),
+            })
+            .unwrap();
+        let store = BrowserStore::new(pool.clone());
+        let opted_in = store
+            .begin_authenticated_with_pre_authorization(&test_session, &pending, None, None, true)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .approve_pre_authorized(&test_session, &opted_in, &registry())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let stage: String =
+            sqlx::query_scalar("SELECT stage FROM browser_authorizations WHERE id=$1")
+                .bind(opted_in.transaction_id())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stage, "awaiting_consent");
+        sqlx::query("UPDATE browser_authorizations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1")
+            .bind(opted_in.transaction_id()).execute(&pool).await.unwrap();
+        assert!(
+            store
+                .approve_pre_authorized(&test_session, &opted_in, &current)
+                .await
+                .is_err()
+        );
         let html = body(completed).await;
         assert!(html.contains("Cuenta: <strong>person@example.test</strong>"));
         let id = form_value(&html, "transaction_id");

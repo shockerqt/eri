@@ -21,6 +21,24 @@ fn resolved(doc: &serde_json::Value, lease: Duration) -> ClientRegistry {
         )
         .unwrap()
 }
+#[test]
+fn generic_metadata_cannot_opt_into_static_pre_authorization() {
+    let mut metadata = document();
+    metadata["authorization_flow"] = "google_preauthorized".into();
+    let projected = resolved(&metadata, Duration::from_secs(60));
+    let pending = projected
+        .validate_pending(AuthorizationRequest {
+            client_id: ID,
+            redirect_uri: REDIRECT,
+            response_type: "code",
+            code_challenge_method: "S256",
+            code_challenge: &crate::s256_challenge(VERIFIER).unwrap(),
+            scopes: &["openid", "offline_access"],
+            resource: Some(RESOURCE),
+        })
+        .unwrap();
+    assert!(!projected.pre_authorizes(&pending));
+}
 async fn fixture_state(
     pool: &PgPool,
 ) -> (

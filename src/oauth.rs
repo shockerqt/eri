@@ -11,6 +11,14 @@ use url::Url;
 pub enum RedirectKind {
     Exact,
     NativeLoopback,
+    /// Static operator assertion backed by a verified native app/domain association.
+    AppClaimedHttps,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AuthorizationFlow {
+    #[default]
+    Interactive,
+    GooglePreauthorized,
 }
 #[derive(Clone, Debug)]
 pub struct RegisteredRedirect {
@@ -27,6 +35,7 @@ pub struct FirstPartyClient {
     default_resource: Option<String>,
     browser_origins: BTreeSet<String>,
     post_logout_redirects: BTreeSet<String>,
+    authorization_flow: AuthorizationFlow,
 }
 #[derive(Clone, Debug, Default)]
 pub struct ClientRegistry {
@@ -102,6 +111,12 @@ impl RegisteredRedirect {
         {
             return Err(OAuthError::InvalidClientDeclaration);
         }
+        if kind == RedirectKind::AppClaimedHttps
+            && (parsed.scheme() != "https"
+                || !matches!(parsed.host(), Some(url::Host::Domain(host)) if host != "localhost"))
+        {
+            return Err(OAuthError::InvalidClientDeclaration);
+        }
         Ok(Self { uri, kind })
     }
 }
@@ -117,6 +132,30 @@ impl FirstPartyClient {
         default_resource: Option<String>,
         browser_origins: impl IntoIterator<Item = impl Into<String>>,
         post_logout_redirects: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, OAuthError> {
+        Self::with_authorization_flow(
+            id,
+            display_name,
+            redirects,
+            scopes,
+            resources,
+            default_resource,
+            browser_origins,
+            post_logout_redirects,
+            AuthorizationFlow::Interactive,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_authorization_flow(
+        id: impl Into<String>,
+        display_name: impl Into<String>,
+        redirects: Vec<RegisteredRedirect>,
+        scopes: impl IntoIterator<Item = impl Into<String>>,
+        resources: impl IntoIterator<Item = impl Into<String>>,
+        default_resource: Option<String>,
+        browser_origins: impl IntoIterator<Item = impl Into<String>>,
+        post_logout_redirects: impl IntoIterator<Item = impl Into<String>>,
+        authorization_flow: AuthorizationFlow,
     ) -> Result<Self, OAuthError> {
         let id = id.into();
         let display_name = display_name.into();
@@ -166,6 +205,7 @@ impl FirstPartyClient {
             default_resource,
             browser_origins,
             post_logout_redirects,
+            authorization_flow,
         })
     }
     pub fn id(&self) -> &str {
@@ -208,6 +248,22 @@ impl ClientRegistry {
     }
     pub fn contains_client(&self, client_id: &str) -> bool {
         self.clients.contains_key(client_id)
+    }
+    pub fn pre_authorizes(&self, pending: &PendingAuthorizationGrant) -> bool {
+        pending.dynamic.is_none()
+            && self.dynamic.is_none()
+            && self.clients.get(pending.client_id()).is_some_and(|client| {
+                client.authorization_flow == AuthorizationFlow::GooglePreauthorized
+                    && client.redirects.iter().any(|redirect| {
+                        redirect.kind == RedirectKind::AppClaimedHttps
+                            && redirect.uri.as_bytes() == pending.redirect_uri().as_bytes()
+                    })
+                    && client.resources.contains(pending.resource())
+                    && pending
+                        .scopes()
+                        .iter()
+                        .all(|scope| client.scopes.contains(scope))
+            })
     }
     /// Request-local projection; the shared first-party registry is never modified.
     pub fn project_cimd(
@@ -651,7 +707,7 @@ fn redirect_matches(registered: &RegisteredRedirect, actual: &str) -> bool {
     if registered.uri.as_bytes() == actual.as_bytes() {
         return true;
     }
-    if registered.kind == RedirectKind::Exact {
+    if registered.kind != RedirectKind::NativeLoopback {
         return false;
     }
     let Some((registered_host, registered_suffix)) = loopback_parts(&registered.uri) else {

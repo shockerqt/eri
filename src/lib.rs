@@ -26,7 +26,8 @@ pub use identity::{AuthenticatedUser, ExternalIdentity};
 pub use keys::{KeyError, SigningKeys};
 pub use logout::{LogoutChallenge, LogoutOutcome, LogoutStore};
 pub use oauth::{
-    AuthorizationRequest, ClientRegistry, FirstPartyClient, OAuthError, PendingAuthorizationGrant,
-    RedirectKind, RegisteredRedirect, ValidatedAuthorizationGrant, s256_challenge, verify_s256,
+    AuthorizationFlow, AuthorizationRequest, ClientRegistry, FirstPartyClient, OAuthError,
+    PendingAuthorizationGrant, RedirectKind, RegisteredRedirect, ValidatedAuthorizationGrant,
+    s256_challenge, verify_s256,
 };
 pub use web::{AppState, router};

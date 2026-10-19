@@ -7,12 +7,18 @@ struct Args {
     /// Path to the TOML configuration file.
     #[arg(long, env = "ERI_CONFIG")]
     config: std::path::PathBuf,
+    /// Validate the configuration file without loading keys or connecting to the database.
+    #[arg(long)]
+    check_config: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = Config::load(&args.config)?;
+    if args.check_config {
+        return Ok(());
+    }
     let keys = SigningKeys::load(&config.signing.manifest)?;
     let database = Database::connect(&config.database).await?;
     database.migrate().await?;
@@ -38,4 +44,17 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_config_is_an_explicit_switch() {
+        let args = Args::try_parse_from(["eri", "--config", "eri.toml", "--check-config"]).unwrap();
+        assert!(args.check_config);
+        let args = Args::try_parse_from(["eri", "--config", "eri.toml"]).unwrap();
+        assert!(!args.check_config);
+    }
 }

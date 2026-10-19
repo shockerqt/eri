@@ -104,8 +104,22 @@ authorization grant. Token requests must preserve that binding; refresh cannot
 expand it. Explicitly reject unsupported multiple-resource requests rather than
 silently choosing one. OIDC-only userinfo uses only the Eri UserInfo audience;
 combined grants include it alongside the authorized resource audience.
-Requesting offline_access requires explicit consent before refresh
-issuance. Generic MCP clients always require user consent showing verified client
+Requesting offline_access requires explicit authorization before refresh
+issuance. A static client can opt into `authorization_flow = "google_preauthorized"`
+only after its operator has approved all declared scopes and resources, including
+`offline_access`; omission defaults to interactive consent. The request must
+select an explicitly declared resource and an exact `app_claimed_https` redirect.
+The latter is an operator assertion backed by verified native domain association
+and the actual signed application, following RFC 8252 section 8.6; the server does
+not fetch or verify asset links at runtime. A public client ID, PKCE, an ordinary
+`exact` HTTPS URI or a custom scheme alone cannot authorize automatic approval.
+Other redirects on the same client retain interactive consent. This operator approval is never inferred
+from Google sign-in, a provider SSO cookie, or client metadata. `prompt=consent`
+still requires the user form. With a current SSO session, eligible requests issue
+a code directly; otherwise Eri redirects through the existing browser-bound Google
+transaction and returns directly to the client after verified login. `prompt=none`
+uses only an eligible SSO session; `prompt=login` and `max_age` retain conservative
+reauthentication checks. Generic MCP clients always require user consent showing verified client
 identity, scope and resource; an SSO cookie alone does not imply authorization.
 
 ## Browser federation and session persistence

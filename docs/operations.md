@@ -68,6 +68,17 @@ Token verification permits 30 seconds of clock skew when evaluating `exp`.
 Resource servers should keep their clocks synchronized and use the same reviewed
 skew rather than silently widening it.
 
+## Native client preauthorization
+
+Before assigning `kind = "app_claimed_https"`, verify the exact native manifest,
+actual release signer and HTTPS domain association (Android `assetlinks.json`).
+Eri validates the URI syntax and exact match, not the installed application or
+public association. Keep that evidence with the reviewed client registration.
+Changing from a custom scheme to Android App Links requires a new native build;
+retain the custom redirect only for interactive legacy clients. Never redirect
+the HTTPS callback to an unverified custom scheme as a fallback. The staging
+publication, verification and rollback belong to INF-015 and BAL-033.
+
 ## Health and startup
 
 `/health/live` reports only process liveness. `/health/ready` runs a bounded
@@ -76,6 +87,21 @@ details. Startup loads keys, connects a bounded pool, applies embedded migration
 binds the configured loopback socket, and shuts down gracefully on SIGINT or
 SIGTERM. Database URLs and key material must never be passed as command arguments
 or written to logs.
+
+Migration `202610190005` adds `browser_authorizations.allow_pre_authorization`
+with a false default, so existing and in-flight transactions continue through
+consent. The migration is additive, but SQLx's embedded migrator rejects an
+applied migration missing from an older binary. A release using seven migrations
+therefore needs a reviewed compatible rollback artifact or a database restore
+plan before activation; switching only to a six-migration binary is not a valid
+rollback. This describes the source schema contract, not an installed update.
+
+`eri --config /path/to/eri.toml --check-config` parses and validates the TOML,
+issuer, bind, client declarations and local authorization policy, then exits
+without loading signing files, reading the Google secret, connecting to PostgreSQL,
+applying migrations or binding a socket. It does not prove that those runtime
+dependencies are ready; use the reviewed staging rollout and health checks for
+that evidence. The command prints no configuration or secret values.
 
 The foundation serves `/health/live`, `/health/ready`, and `/jwks` only. OIDC and
 OAuth authorization-server discovery are added with their conforming metadata

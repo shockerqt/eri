@@ -16,7 +16,8 @@ explicit resource in this local allowlist; remote metadata cannot authorize a
 scope, resource, browser origin, post-logout redirect or custom app scheme.
 `allow_refresh` defaults to false. Refresh additionally requires the document's
 `refresh_token` grant and explicit consent for `offline_access`. The existing
-provider SSO cookie never skips consent; `prompt=none` cannot approve a grant.
+provider SSO cookie never skips consent for CIMD; `prompt=none` cannot approve a
+generic grant. Static clients can separately opt into operator preauthorization.
 
 A public client uses an HTTPS metadata URL as its exact `client_id`. For example:
 

@@ -1,6 +1,6 @@
 use eri::{
-    AuthorizationRequest, ClientRegistry, FirstPartyClient, RedirectKind, RegisteredRedirect,
-    s256_challenge, verify_s256,
+    AuthorizationFlow, AuthorizationRequest, ClientRegistry, FirstPartyClient, RedirectKind,
+    RegisteredRedirect, s256_challenge, verify_s256,
 };
 
 fn registry() -> ClientRegistry {
@@ -39,6 +39,98 @@ fn registry() -> ClientRegistry {
         .unwrap(),
     ])
     .unwrap()
+}
+
+#[test]
+fn pre_authorization_requires_explicit_static_policy_and_resource() {
+    let trusted = FirstPartyClient::with_authorization_flow(
+        "web",
+        "Balance",
+        vec![
+            RegisteredRedirect::new(
+                "https://app.example/callback",
+                RedirectKind::AppClaimedHttps,
+            )
+            .unwrap(),
+        ],
+        ["openid", "offline_access"],
+        ["https://api.example/resource"],
+        None,
+        ["https://app.example"],
+        Vec::<String>::new(),
+        AuthorizationFlow::GooglePreauthorized,
+    )
+    .unwrap();
+    let trusted_registry =
+        ClientRegistry::with_issuer(vec![trusted], &"https://auth.example/".parse().unwrap())
+            .unwrap();
+    let request = AuthorizationRequest {
+        client_id: "web",
+        redirect_uri: "https://app.example/callback",
+        response_type: "code",
+        code_challenge_method: "S256",
+        code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        scopes: &["openid", "offline_access"],
+        resource: Some("https://api.example/resource"),
+    };
+    let approved = trusted_registry.validate_pending(request.clone()).unwrap();
+    assert!(trusted_registry.pre_authorizes(&approved));
+    let userinfo = trusted_registry
+        .validate_pending(AuthorizationRequest {
+            resource: Some("https://auth.example/userinfo"),
+            ..request
+        })
+        .unwrap();
+    assert!(!trusted_registry.pre_authorizes(&userinfo));
+    assert!(!registry().pre_authorizes(&approved));
+}
+
+#[test]
+fn preauthorization_needs_the_selected_verified_https_redirect_not_just_a_client_id() {
+    let claimed = "https://app.example/auth-callback";
+    let legacy = "balance-dev://auth-callback";
+    let exact_https = "https://app.example/ordinary-callback";
+    let client = FirstPartyClient::with_authorization_flow(
+        "native",
+        "Balance",
+        vec![
+            RegisteredRedirect::new(claimed, RedirectKind::AppClaimedHttps).unwrap(),
+            RegisteredRedirect::new(legacy, RedirectKind::Exact).unwrap(),
+            RegisteredRedirect::new(exact_https, RedirectKind::Exact).unwrap(),
+        ],
+        ["openid", "offline_access"],
+        ["https://api.example/resource"],
+        None,
+        Vec::<String>::new(),
+        Vec::<String>::new(),
+        AuthorizationFlow::GooglePreauthorized,
+    )
+    .unwrap();
+    let registry = ClientRegistry::new(vec![client]).unwrap();
+    for (redirect_uri, expected) in [(claimed, true), (legacy, false), (exact_https, false)] {
+        let pending = registry
+            .validate_pending(AuthorizationRequest {
+                client_id: "native",
+                redirect_uri,
+                response_type: "code",
+                code_challenge_method: "S256",
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                scopes: &["openid", "offline_access"],
+                resource: Some("https://api.example/resource"),
+            })
+            .unwrap();
+        assert_eq!(registry.pre_authorizes(&pending), expected);
+    }
+    for uri in [
+        "balance-dev://auth-callback",
+        "http://app.example/callback",
+        "https://127.0.0.1/callback",
+        "https://localhost/callback",
+    ] {
+        assert!(RegisteredRedirect::new(uri, RedirectKind::AppClaimedHttps).is_err());
+    }
+    assert!(!registry.trusted_redirect("native", "https://app.example/auth-callback/"));
+    assert!(!registry.trusted_redirect("native", "https://app.example:8443/auth-callback"));
 }
 
 fn validate<'a>(

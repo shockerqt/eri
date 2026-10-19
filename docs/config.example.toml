@@ -30,6 +30,15 @@ manifest = "keys/manifest.json"
 # browser_origins = ["https://app.example"]
 # post_logout_redirects = ["https://app.example/signed-out"]
 # redirects = [{ uri = "https://app.example/oauth/callback", kind = "exact" }]
+# authorization_flow = "interactive" # safe default when omitted
+# Set "google_preauthorized" only after the operator explicitly approves this
+# static client's configured scopes and resources, including offline_access.
+# The selected redirect must also have kind = "app_claimed_https", backed by
+# verified domain association and the actual signed native application. This is
+# an operator assertion, not automatic association verification by Eri. Ordinary
+# exact HTTPS and custom-scheme redirects remain interactive for that client.
+# Only requests for declared resources qualify; add the issuer's /userinfo
+# resource explicitly if direct OIDC-only authorization is intended.
 #
 # CIMD remains disabled unless this explicit table is added. Review the server's
 # scope/resource authority before enabling it; metadata grants neither authority

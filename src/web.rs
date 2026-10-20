@@ -356,7 +356,7 @@ async fn authorize_valid(
     let nonce = optional(q, "nonce")?;
     let downstream = optional(q, "state")?;
     let prompt = optional(q, "prompt")?;
-    if prompt.is_some_and(|v| !matches!(v, "none" | "consent" | "login")) {
+    if prompt.is_some_and(|v| !matches!(v, "none" | "consent" | "login" | "select_account")) {
         return Err("invalid_request".into());
     }
     let max_age = optional(q, "max_age")?
@@ -383,7 +383,7 @@ async fn authorize_valid(
     if prompt == Some("login") {
         return Err("login_required".into());
     }
-    if let Some(session) = session {
+    if let Some(session) = session.filter(|_| prompt != Some("select_account")) {
         if let Some(max_age) = max_age {
             let auth_time = BrowserStore::new(s.0.database.pool().clone())
                 .session_upstream_auth_time(&session)
@@ -455,7 +455,7 @@ async fn authorize_valid(
             start.upstream_state(),
             start.upstream_nonce(),
             &start.upstream_challenge(),
-            false,
+            true,
         )
         .map_err(|_| "server_error".to_owned())?;
     let cookie = format!(
@@ -548,7 +548,7 @@ async fn google_start(State(s): State<AppState>, headers: HeaderMap, body: Bytes
     let Ok(challenge) = crate::oauth::s256_challenge(&verifier) else {
         return local_error("Solicitud inválida");
     };
-    let Ok(url) = p.google.authorization_url(state, &nonce, &challenge, false) else {
+    let Ok(url) = p.google.authorization_url(state, &nonce, &challenge, true) else {
         return local_error("No se pudo iniciar el acceso");
     };
     sensitive(Redirect::to(url.as_str()).into_response())
@@ -1767,6 +1767,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let upstream: url::Url = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            upstream
+                .query_pairs()
+                .any(|(key, value)| key == "prompt" && value == "select_account")
+        );
         response
             .headers_mut()
             .insert(header::SET_COOKIE, set_cookie);
@@ -2479,6 +2489,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replay_code.status(), StatusCode::BAD_REQUEST);
+        // Selecting another account bypasses SSO without invalidating its session.
+        let select_account = trusted_app
+            .clone()
+            .oneshot(
+                Request::get(format!("{authorize}&prompt=select_account"))
+                    .header(header::COOKIE, &direct_session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(select_account.status(), StatusCode::SEE_OTHER);
+        let selected: url::Url = select_account.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(selected.origin(), upstream_url.origin());
+        assert_eq!(selected.path(), upstream_url.path());
+        let selected_query = selected
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(selected_query["prompt"], "select_account");
+        assert!(selected_query.contains_key("state"));
+        assert!(selected_query.contains_key("nonce"));
+        assert!(selected_query.contains_key("code_challenge"));
+        assert!(!selected_query.contains_key("code"));
+        for invalid in [
+            "select_account&prompt=select_account",
+            "select_account%20consent",
+            "none%20select_account",
+            "unknown",
+        ] {
+            let rejected = trusted_app
+                .clone()
+                .oneshot(
+                    Request::get(format!("{authorize}&prompt={invalid}"))
+                        .header(header::COOKIE, &direct_session_cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                rejected.headers()[header::LOCATION]
+                    .to_str()
+                    .unwrap()
+                    .contains("error=invalid_request")
+            );
+        }
+        let legacy_selection = app
+            .clone()
+            .oneshot(
+                Request::get(format!("{authorize}&prompt=select_account"))
+                    .header(header::COOKIE, &direct_session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_selection.status(), StatusCode::OK);
+        assert!(
+            body(legacy_selection)
+                .await
+                .contains("Continuar con Google")
+        );
         let silent_direct = trusted_app
             .clone()
             .oneshot(

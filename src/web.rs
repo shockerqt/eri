@@ -1035,26 +1035,47 @@ async fn logout_get(
     let Ok(q) = pairs(&raw.unwrap_or_default(), 4096) else {
         return local_error("Solicitud inválida");
     };
-    if one(&q, "id_token_hint").is_some() {
+    logout_rp(&s, &headers, &q).await
+}
+async fn logout_rp(s: &AppState, headers: &HeaderMap, q: &[(String, String)]) -> Response {
+    if q.iter().any(|(key, _)| {
+        ![
+            "client_id",
+            "post_logout_redirect_uri",
+            "state",
+            "id_token_hint",
+        ]
+        .contains(&key.as_str())
+    }) {
         return local_error("Solicitud inválida");
     }
-    let client = match optional(&q, "client_id") {
-        Ok(v) => v,
-        Err(_) => return local_error("Solicitud inválida"),
-    };
-    let redirect = match optional(&q, "post_logout_redirect_uri") {
-        Ok(v) => v,
-        Err(_) => return local_error("Solicitud inválida"),
-    };
-    if client.is_some() != redirect.is_some() {
+    let (Ok(client), Ok(redirect), Ok(state), Ok(hint)) = (
+        optional(q, "client_id"),
+        optional(q, "post_logout_redirect_uri"),
+        optional(q, "state"),
+        optional(q, "id_token_hint"),
+    ) else {
         return local_error("Solicitud inválida");
-    }
-    let state = match optional(&q, "state") {
-        Ok(v) => v,
-        Err(_) => return local_error("Solicitud inválida"),
     };
     let p = s.0.provider.as_ref().unwrap();
-    let Some(session) = session_from(&headers, &s.0.database, p.secure).await else {
+    let hint = match hint {
+        Some(token) => match s.0.keys.verify_id_logout(token, &p.issuer) {
+            Ok(hint) => Some(hint),
+            Err(_) => return local_error("Solicitud inválida"),
+        },
+        None => None,
+    };
+    if client
+        .zip(hint.as_ref())
+        .is_some_and(|(client, hint)| client != hint.aud)
+    {
+        return local_error("Solicitud inválida");
+    }
+    let client = client.or_else(|| hint.as_ref().map(|hint| hint.aud.as_str()));
+    if redirect.is_some() && client.is_none() || state.is_some() && redirect.is_none() {
+        return local_error("Solicitud inválida");
+    }
+    let Some(session) = session_from(headers, &s.0.database, p.secure).await else {
         return local_error("Sesión inválida");
     };
     let store = LogoutStore::new(s.0.database.pool().clone());
@@ -1064,19 +1085,55 @@ async fn logout_get(
                 .begin(&session, client, redirect, state, &p.registry)
                 .await
         }
-        (None, None) => store.begin_local(&session, &p.issuer).await,
+        (_, None) => store.begin_local(&session, &p.issuer).await,
         _ => unreachable!(),
     };
-    match challenge {
-        Ok(c) => form_page(render_logout(&c), c.redirect_uri()),
-        Err(_) => local_error("Solicitud inválida"),
+    let Ok(challenge) = challenge else {
+        return local_error("Solicitud inválida");
+    };
+    // Local logout always asks; the reviewed exception requires a registered RP return.
+    if let Some(hint) = hint.filter(|_| redirect.is_some()) {
+        match store
+            .finish_hint(&session, &challenge, &p.registry, &hint)
+            .await
+        {
+            Ok(Some(outcome)) => return logout_response(p, outcome),
+            Ok(None) => {}
+            Err(_) => return local_error("Solicitud inválida"),
+        }
     }
+    form_page(render_logout(&challenge), challenge.redirect_uri())
 }
-async fn logout_post(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn logout_post(
+    State(s): State<AppState>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if raw.is_some_and(|raw| !raw.is_empty())
+        || !headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.split(';').next().is_some_and(|v| {
+                    v.trim()
+                        .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+                })
+            })
+    {
+        return local_error("Solicitud inválida");
+    }
     let Ok(q) = pairs_bytes(&body, 4096) else {
         return local_error("Solicitud inválida");
     };
-    let (Some(id), Some(csrf)) = (one(&q, "challenge"), one(&q, "csrf")) else {
+    let confirmation = q.iter().any(|(key, _)| key == "challenge" || key == "csrf");
+    if !confirmation {
+        return logout_rp(&s, &headers, &q).await;
+    }
+    if q.iter().any(|(key, _)| key != "challenge" && key != "csrf") {
+        return local_error("Solicitud inválida");
+    }
+    let (Ok(Some(id)), Ok(Some(csrf))) = (optional(&q, "challenge"), optional(&q, "csrf")) else {
         return local_error("Solicitud inválida");
     };
     let Ok(id) = Uuid::parse_str(id) else {
@@ -1097,21 +1154,22 @@ async fn logout_post(State(s): State<AppState>, headers: HeaderMap, body: Bytes)
         )
         .await
     {
-        Ok(v) => {
-            let mut r = redirect_params(&v.redirect_uri, &[("state", v.state.as_deref())]);
-            r.headers_mut().append(
-                header::SET_COOKIE,
-                HeaderValue::from_str(&format!(
-                    "{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}",
-                    session_cookie(p.secure),
-                    if p.secure { "; Secure" } else { "" }
-                ))
-                .unwrap(),
-            );
-            sensitive(r)
-        }
+        Ok(outcome) => logout_response(p, outcome),
         Err(_) => local_error("Solicitud inválida"),
     }
+}
+fn logout_response(p: &Provider, v: crate::LogoutOutcome) -> Response {
+    let mut r = redirect_params(&v.redirect_uri, &[("state", v.state.as_deref())]);
+    r.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}",
+            session_cookie(p.secure),
+            if p.secure { "; Secure" } else { "" }
+        ))
+        .unwrap(),
+    );
+    sensitive(r)
 }
 
 fn pairs_bytes(body: &Bytes, max: usize) -> Result<Vec<(String, String)>, ()> {
@@ -1530,6 +1588,8 @@ const CSS: &str = "*{box-sizing:border-box}html{background:#111918;color:#f1f2e9
 mod tests {
     #[path = "cimd_security.rs"]
     mod cimd_security;
+    #[path = "logout_hints.rs"]
+    mod logout_hints;
     #[path = "mcp_compatibility.rs"]
     mod mcp_compatibility;
 
@@ -2920,6 +2980,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::post("/logout")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                     .header(header::COOKIE, &session_cookie)
                     .header(header::ORIGIN, "http://127.0.0.1:18082")
                     .body(Body::from(logout_form))

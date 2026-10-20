@@ -31,6 +31,8 @@ manifest = "keys/manifest.json"
 # post_logout_redirects = ["https://app.example/signed-out"]
 # redirects = [{ uri = "https://app.example/oauth/callback", kind = "exact" }]
 # authorization_flow = "interactive" # safe default when omitted
+# logout_flow = "interactive" # independent safe default; reviewed static-only exception: id_token_hint
+# See docs/logout.md for bearer-replay risk before opting in.
 # Set "google_preauthorized" only after the operator explicitly approves this
 # static client's configured scopes and resources, including offline_access.
 # The selected redirect must also have kind = "app_claimed_https", backed by

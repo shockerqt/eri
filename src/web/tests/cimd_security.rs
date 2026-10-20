@@ -25,6 +25,7 @@ fn resolved(doc: &serde_json::Value, lease: Duration) -> ClientRegistry {
 fn generic_metadata_cannot_opt_into_static_pre_authorization() {
     let mut metadata = document();
     metadata["authorization_flow"] = "google_preauthorized".into();
+    metadata["logout_flow"] = "id_token_hint".into();
     let projected = resolved(&metadata, Duration::from_secs(60));
     let pending = projected
         .validate_pending(AuthorizationRequest {
@@ -38,6 +39,7 @@ fn generic_metadata_cannot_opt_into_static_pre_authorization() {
         })
         .unwrap();
     assert!(!projected.pre_authorizes(&pending));
+    assert!(!projected.allows_id_token_logout(ID));
 }
 async fn fixture_state(
     pool: &PgPool,

@@ -17,6 +17,8 @@ pub struct AccessClaims {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IdClaims {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<Uuid>,
     pub iss: String,
     pub sub: Uuid,
     pub aud: String,
@@ -65,6 +67,7 @@ pub fn issue(
     })?;
     let id_token = if initial && exchange.scopes.iter().any(|scope| scope == "openid") {
         Some(keys.sign_id(&IdClaims {
+            sid: Some(exchange.session_id),
             iss: issuer.into(),
             sub: exchange.user_id,
             aud: exchange.client_id,

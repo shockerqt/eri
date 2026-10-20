@@ -29,9 +29,8 @@ resource, scope, and post-logout redirect allowlists.
 When authorization configuration is present, Eri exposes discovery,
 authorization and Google callback, server-rendered consent, token and revocation,
 UserInfo, and confirmed local logout. Foundation-only configuration continues to
-expose health and JWKS and withholds provider discovery. RP-Initiated Logout hint
-conformance remains deferred, so metadata withholds `end_session_endpoint` and
-`/logout` rejects `id_token_hint`. Optional [CIMD](docs/cimd.md) registration uses
+expose health and JWKS and withholds provider discovery. RP logout hints use signed session identifiers and an explicit static-client
+confirmation exception; see [logout policy](docs/logout.md). Optional [CIMD](docs/cimd.md) registration uses
 explicit local scope/resource policy and is disabled by default. DCR is not
 implemented or advertised. Synthetic tests do
 not replace real Google and application compatibility checks in staging.

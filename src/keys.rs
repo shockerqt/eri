@@ -148,6 +148,42 @@ impl SigningKeys {
         Ok(jsonwebtoken::encode(&header, claims, &self.encoding)?)
     }
 
+    /// Logout hints are identity tokens, never access tokens. Expiry is intentionally
+    /// checked against the still-active exact provider session by LogoutStore.
+    pub fn verify_id_logout(
+        &self,
+        token: &str,
+        issuer: &str,
+    ) -> Result<crate::tokens::IdClaims, KeyError> {
+        let header = jsonwebtoken::decode_header(token)?;
+        if header.alg != Algorithm::RS256
+            || header.typ.as_deref() != Some("JWT")
+            || has_unsupported_crit(token)
+        {
+            return Err(invalid("logout hint algorithm or type is invalid"));
+        }
+        let kid = header.kid.ok_or_else(|| invalid("token kid is missing"))?;
+        let key = self
+            .decoding
+            .get(&kid)
+            .ok_or_else(|| invalid("token kid is unknown"))?;
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_issuer(&[issuer]);
+        // Decode the signed audience, then bind it to the RP inside the session lock.
+        validation.validate_aud = false;
+        validation.validate_exp = false;
+        validation.set_required_spec_claims(&["exp", "iat", "sub", "iss", "aud"]);
+        let claims =
+            jsonwebtoken::decode::<crate::tokens::IdClaims>(token, key, &validation)?.claims;
+        if claims.aud.is_empty()
+            || claims.exp <= claims.iat
+            || claims.iat > chrono::Utc::now().timestamp() + CLOCK_SKEW_SECONDS as i64
+        {
+            return Err(invalid("logout hint claims are invalid"));
+        }
+        Ok(claims)
+    }
+
     pub fn verify<T: DeserializeOwned>(
         &self,
         token: &str,

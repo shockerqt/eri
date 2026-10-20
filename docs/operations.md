@@ -8,8 +8,8 @@ named by `client_secret_env` must resolve to a nonempty value at startup. Withou
 that section Eri serves health and JWKS only and withholds discovery.
 
 Local `/logout` uses a confirmed session and CSRF challenge with an exact
-registered post-logout destination. It is not advertised as an OIDC
-`end_session_endpoint` until ID-token hint conformance is implemented.
+registered post-logout destination. Reviewed static clients may opt into the
+[ID-token hint confirmation exception](logout.md). No schema migration is needed.
 
 ## Persistence cleanup
 

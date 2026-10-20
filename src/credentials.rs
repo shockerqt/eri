@@ -63,6 +63,7 @@ pub struct CredentialStore {
 
 #[derive(Debug)]
 pub struct ExchangeResult {
+    pub session_id: Uuid,
     pub user_id: Uuid,
     pub client_id: String,
     pub scopes: Vec<String>,
@@ -287,6 +288,7 @@ impl CredentialStore {
         }
         tx.commit().await?;
         Ok(ExchangeResult {
+            session_id: code.session_id,
             user_id: session.user_id,
             client_id: code.client_id,
             scopes: code.scopes,
@@ -434,6 +436,7 @@ impl CredentialStore {
         }
         tx.commit().await?;
         Ok(ExchangeResult {
+            session_id: lookup.session_id,
             user_id: session.user_id,
             client_id: family.client_id,
             scopes: family.scopes,

@@ -9,7 +9,7 @@ test: test-oauth-smoke test-rss test-provider-proof
 	cargo test --locked
 
 test-oauth-smoke:
-	node --test scripts/staging-oauth-smoke.test.mjs
+	node --test scripts/staging-oauth-smoke.test.mjs scripts/production-enrollment.test.mjs
 
 test-rss:
 	node --test scripts/staging-rss.test.mjs

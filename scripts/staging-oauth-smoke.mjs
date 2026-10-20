@@ -87,18 +87,18 @@ export function transaction() {
 
 // Use the discovered UserInfo resource: the diagnostic registration has no
 // separately declared API resources. Eri grants this resource with openid.
-export function oauthRequestBuilder(endpoints) {
+export function oauthRequestBuilder(endpoints, { client = CLIENT, callback = CALLBACK, scope = 'openid profile email offline_access' } = {}) {
   const resource = endpoints.userinfo_endpoint;
   return {
     authorization(pending) {
       const url = new URL(endpoints.authorization_endpoint);
-      url.search = new URLSearchParams({ client_id: CLIENT, redirect_uri: CALLBACK, response_type: 'code',
-        scope: 'openid profile email offline_access', resource, state: pending.state,
+      url.search = new URLSearchParams({ client_id: client, redirect_uri: callback, response_type: 'code',
+        scope, resource, state: pending.state,
         nonce: pending.nonce, code_challenge: pending.challenge, code_challenge_method: 'S256' }).toString();
       return url;
     },
     token(fields) {
-      return new URLSearchParams({ client_id: CLIENT, ...fields, resource });
+      return new URLSearchParams({ ...fields, client_id: client, resource });
     },
   };
 }

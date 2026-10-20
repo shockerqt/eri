@@ -20,6 +20,12 @@ pub enum AuthorizationFlow {
     Interactive,
     GooglePreauthorized,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogoutFlow {
+    #[default]
+    Interactive,
+    IdTokenHint,
+}
 #[derive(Clone, Debug)]
 pub struct RegisteredRedirect {
     uri: String,
@@ -36,6 +42,7 @@ pub struct FirstPartyClient {
     browser_origins: BTreeSet<String>,
     post_logout_redirects: BTreeSet<String>,
     authorization_flow: AuthorizationFlow,
+    logout_flow: LogoutFlow,
 }
 #[derive(Clone, Debug, Default)]
 pub struct ClientRegistry {
@@ -206,7 +213,12 @@ impl FirstPartyClient {
             browser_origins,
             post_logout_redirects,
             authorization_flow,
+            logout_flow: LogoutFlow::Interactive,
         })
+    }
+    pub fn with_logout_flow(mut self, flow: LogoutFlow) -> Self {
+        self.logout_flow = flow;
+        self
     }
     pub fn id(&self) -> &str {
         &self.id
@@ -363,6 +375,12 @@ impl ClientRegistry {
         self.clients
             .get(client_id)
             .is_some_and(|c| c.redirects.iter().any(|r| redirect_matches(r, uri)))
+    }
+    /// Only explicit static policy can authorize the confirmation exception.
+    pub fn allows_id_token_logout(&self, client_id: &str) -> bool {
+        self.clients
+            .get(client_id)
+            .is_some_and(|c| c.logout_flow == LogoutFlow::IdTokenHint)
     }
     pub fn valid_post_logout_redirect(&self, client_id: &str, uri: &str) -> bool {
         self.clients.get(client_id).is_some_and(|c| {

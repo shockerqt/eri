@@ -513,6 +513,7 @@ async fn run_resource_contract(pool: PgPool, generic: bool) {
         .clone()
         .oneshot(
             Request::post("/logout")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .header(header::COOKIE, &session_cookie)
                 .header(header::ORIGIN, issuer)
                 .body(Body::from(logout_form))

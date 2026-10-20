@@ -1,5 +1,6 @@
 use crate::oauth::{
-    AuthorizationFlow, ClientRegistry, FirstPartyClient, RedirectKind, RegisteredRedirect,
+    AuthorizationFlow, ClientRegistry, FirstPartyClient, LogoutFlow, RedirectKind,
+    RegisteredRedirect,
 };
 use serde::Deserialize;
 use std::{
@@ -102,6 +103,8 @@ pub struct ClientDeclaration {
     pub post_logout_redirects: Vec<String>,
     #[serde(default)]
     pub authorization_flow: ConfiguredAuthorizationFlow,
+    #[serde(default)]
+    pub logout_flow: ConfiguredLogoutFlow,
 }
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,6 +112,13 @@ pub enum ConfiguredAuthorizationFlow {
     #[default]
     Interactive,
     GooglePreauthorized,
+}
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfiguredLogoutFlow {
+    #[default]
+    Interactive,
+    IdTokenHint,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -277,6 +287,12 @@ impl Config {
                                 }
                             },
                         )
+                        .map(|client| {
+                            client.with_logout_flow(match c.logout_flow {
+                                ConfiguredLogoutFlow::Interactive => LogoutFlow::Interactive,
+                                ConfiguredLogoutFlow::IdTokenHint => LogoutFlow::IdTokenHint,
+                            })
+                        })
                         .map_err(|_| invalid("authorization client is invalid"))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -447,6 +463,7 @@ mod tests {
                 browser_origins: vec!["https://app.example".into()],
                 post_logout_redirects: vec!["https://app.example/signed-out".into()],
                 authorization_flow: ConfiguredAuthorizationFlow::Interactive,
+                logout_flow: ConfiguredLogoutFlow::Interactive,
             }],
         });
         value.validate().unwrap();
@@ -454,6 +471,16 @@ mod tests {
         assert!(registry.trusted_redirect("web", "https://app.example/callback"));
         assert!(!registry.trusted_redirect("web", "https://app.example/signed-out"));
         assert!(registry.valid_post_logout_redirect("web", "https://app.example/signed-out"));
+        assert!(!registry.allows_id_token_logout("web"));
+        value.authorization.as_mut().unwrap().clients[0].logout_flow =
+            ConfiguredLogoutFlow::IdTokenHint;
+        assert!(
+            value
+                .authorization_registry()
+                .unwrap()
+                .unwrap()
+                .allows_id_token_logout("web")
+        );
     }
 
     #[test]
@@ -468,6 +495,28 @@ mod tests {
             clients: vec![],
         });
         assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn logout_flow_is_explicit_strict_and_independent() {
+        let base = "id='web'\ndisplay_name='Web'\nscopes=['openid']\nredirects=[{uri='https://app.example/callback',kind='exact'}]";
+        let default: ClientDeclaration = toml::from_str(base).unwrap();
+        assert_eq!(default.logout_flow, ConfiguredLogoutFlow::Interactive);
+        let opt_in: ClientDeclaration =
+            toml::from_str(&format!("{base}\nlogout_flow='id_token_hint'")).unwrap();
+        assert_eq!(opt_in.logout_flow, ConfiguredLogoutFlow::IdTokenHint);
+        assert!(matches!(
+            opt_in.authorization_flow,
+            ConfiguredAuthorizationFlow::Interactive
+        ));
+        let auth_only: ClientDeclaration = toml::from_str(&format!(
+            "{base}\nauthorization_flow='google_preauthorized'"
+        ))
+        .unwrap();
+        assert_eq!(auth_only.logout_flow, ConfiguredLogoutFlow::Interactive);
+        assert!(
+            toml::from_str::<ClientDeclaration>(&format!("{base}\nlogout_flow='other'")).is_err()
+        );
     }
 
     #[test]

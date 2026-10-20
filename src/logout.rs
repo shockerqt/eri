@@ -23,6 +23,13 @@ struct LogoutRow {
     expires_at: DateTime<Utc>,
     consumed_at: Option<DateTime<Utc>>,
 }
+#[derive(sqlx::FromRow)]
+struct SessionLogoutRow {
+    expires_at: DateTime<Utc>,
+    revoked_at: Option<DateTime<Utc>>,
+    user_id: Uuid,
+    auth_time: DateTime<Utc>,
+}
 impl LogoutChallenge {
     pub fn id(&self) -> Uuid {
         self.id
@@ -106,9 +113,30 @@ impl LogoutStore {
         challenge: &LogoutChallenge,
         registry: &ClientRegistry,
     ) -> Result<LogoutOutcome, CredentialError> {
+        self.finish_inner(session, challenge, registry, None)
+            .await?
+            .ok_or(CredentialError::InvalidGrant)
+    }
+    pub(crate) async fn finish_hint(
+        &self,
+        session: &ProviderSession,
+        challenge: &LogoutChallenge,
+        registry: &ClientRegistry,
+        hint: &crate::tokens::IdClaims,
+    ) -> Result<Option<LogoutOutcome>, CredentialError> {
+        self.finish_inner(session, challenge, registry, Some(hint))
+            .await
+    }
+    async fn finish_inner(
+        &self,
+        session: &ProviderSession,
+        challenge: &LogoutChallenge,
+        registry: &ClientRegistry,
+        hint: Option<&crate::tokens::IdClaims>,
+    ) -> Result<Option<LogoutOutcome>, CredentialError> {
         let mut tx = self.pool.begin().await?;
-        let session_row: Option<(DateTime<Utc>, Option<DateTime<Utc>>)> = sqlx::query_as(
-            "SELECT expires_at,revoked_at FROM provider_sessions WHERE id=$1 FOR UPDATE",
+        let session_row: Option<SessionLogoutRow> = sqlx::query_as(
+            "SELECT expires_at,revoked_at,user_id,auth_time FROM provider_sessions WHERE id=$1 FOR UPDATE",
         )
         .bind(session.id)
         .fetch_optional(&mut *tx)
@@ -123,9 +151,9 @@ impl LogoutStore {
         let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *tx)
             .await?;
-        let (session_expiry, session_revoked) = session_row.unwrap();
-        if session_revoked.is_some()
-            || session_expiry <= now
+        let session_row = session_row.unwrap();
+        if session_row.revoked_at.is_some()
+            || session_row.expires_at <= now
             || row.consumed_at.is_some()
             || row.expires_at <= now
             || !row.client_id.is_empty()
@@ -133,6 +161,22 @@ impl LogoutStore {
                     .valid_post_logout_redirect(&row.client_id, &row.post_logout_redirect_uri)
         {
             return Err(CredentialError::InvalidGrant);
+        }
+        if let Some(hint) = hint {
+            let skew = crate::keys::CLOCK_SKEW_SECONDS as i64;
+            if hint.aud != row.client_id
+                || hint.exp <= hint.iat
+                || hint.iat > now.timestamp() + skew
+            {
+                return Err(CredentialError::InvalidGrant);
+            }
+            if !registry.allows_id_token_logout(&row.client_id)
+                || hint.sub != session_row.user_id
+                || hint.sid != Some(session.id)
+                || hint.iat < session_row.auth_time.timestamp() - skew
+            {
+                return Ok(None);
+            }
         }
         sqlx::query("UPDATE logout_challenges SET consumed_at=$2 WHERE id=$1")
             .bind(challenge.id)
@@ -152,9 +196,9 @@ impl LogoutStore {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(LogoutOutcome {
+        Ok(Some(LogoutOutcome {
             redirect_uri: row.post_logout_redirect_uri,
             state: row.downstream_state,
-        })
+        }))
     }
 }

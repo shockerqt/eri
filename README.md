@@ -73,3 +73,11 @@ launcher supplies only isolated test database credentials.
 CI runs the full check on GitHub's native Ubuntu 24.04 ARM runner and packages
 the deployable `aarch64-unknown-linux-gnu` release binary with its exact source
 SHA, Rust target identity, and SHA-256 checksum. It does not deploy the artifact.
+
+Account selection: `/authorize?prompt=select_account` bypasses Eri SSO reuse
+without revoking the remembered provider session. New Google authorization starts
+(including the interactive login form) always request Google's `select_account`
+chooser. Ordinary valid SSO requests still reuse the session; `prompt=consent`
+retains manual consent, and `prompt=login` remains fail closed because fresh
+authentication cannot be guaranteed. Only single supported prompt values are
+accepted; combined or duplicate prompts are rejected. No schema change is needed.

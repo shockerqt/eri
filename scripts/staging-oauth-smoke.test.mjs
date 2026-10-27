@@ -160,6 +160,7 @@ test('response boundaries reject oversized, malformed, redirected and non-JSON b
   assert.equal(result.status, 200);
   assert.equal(observed.redirect, 'error');
   assert.ok(observed.signal instanceof AbortSignal);
+  assert.equal(observed.headers.get('user-agent'), 'Balance-Delivery/1.0');
 });
 
 test('replay success requires exact HTTP 400 invalid_grant, never arbitrary failure', () => {
@@ -169,4 +170,162 @@ test('replay success requires exact HTTP 400 invalid_grant, never arbitrary fail
     { status: 401, data: { error: 'invalid_grant' } }, { status: 400, data: {} }]) {
     assert.throws(() => assertInvalidGrant(result));
   }
+});
+
+// Every credential below is generated synthetic data; no external request occurs.
+async function continuityFixture(change = {}) {
+  const { runDiagnostic, manualCheckpoint } = await import('./staging-oauth-smoke.mjs');
+  const output = [], checkpoints = [];
+  let grants = 0, keysReads = 0, replay = false, loggedOut = false, clock = now;
+  const endpoints = { authorization_endpoint: `${issuer}/authorize`, token_endpoint: `${issuer}/token`,
+    jwks_uri: `${issuer}/jwks`, userinfo_endpoint: `${issuer}/userinfo` };
+  const metadata = { ...endpoints, issuer, code_challenge_methods_supported: ['S256'],
+    token_endpoint_auth_methods_supported: ['none'], authorization_response_iss_parameter_supported: true };
+  let nonce;
+  const request = async (url, options = {}) => {
+    if (url.includes('/.well-known/')) return { status: 200, data: metadata };
+    if (url === endpoints.jwks_uri) {
+      keysReads++;
+      return { status: 200, data: { keys: keysReads === 1 || change.missingNewKey ? [jwk] : change.missingKey ? [{ ...jwk, kid: 'next' }] : [jwk, { ...jwk, kid: 'next' }] } };
+    }
+    if (url === endpoints.userinfo_endpoint) return { status: 200, data: { sub: accessClaims.sub } };
+    const form = options.body;
+    if (form.get('grant_type') === 'authorization_code') replay = false;
+    if (loggedOut || replay || (grants === 4 && form.get('refresh_token') === 'synthetic-refresh-3')) {
+      replay = true;
+      return { status: 400, data: { error: 'invalid_grant' } };
+    }
+    grants++;
+    const kid = grants >= 3 && !change.sameKid ? 'next' : jwk.kid;
+    const claims = { ...accessClaims, ...(grants === 2 && change.wrongSubject ? { sub: 'other-private-subject' } : {}),
+      ...(change.expired && grants === 2 ? { exp: now - 1, iat: now - 60 } : {}) };
+    const data = { token_type: 'Bearer', expires_in: 300, access_token: jwt(claims, { kid }), refresh_token: `synthetic-refresh-${grants}` };
+    if (form.get('grant_type') === 'authorization_code') data.id_token = jwt({ ...claims, aud: client, nonce }, { typ: 'JWT', kid });
+    return { status: 200, data };
+  };
+  const result = await runDiagnostic(issuer, { continuity: true, request, now: () => clock,
+    listen: async (pending) => { nonce = pending.nonce; return { code: 'synthetic-private-code' }; },
+    checkpoint: async (name) => {
+      checkpoints.push(name);
+      if (change.overlapExpired && name === 'rotation-retained-key-overlap') clock = now + 301;
+      if (change.abort === name) await manualCheckpoint(name, async () => '');
+      if (name === 'logout-confirmed') { loggedOut = true; replay = false; }
+    }, output: (line) => output.push(line), error: (line) => output.push(line) });
+  return { result, output: output.join('\n'), checkpoints, keysReads, grants };
+}
+
+test('live continuity composes restart, overlap, new kid, refresh replay and logout on existing grants', async () => {
+  const run = await continuityFixture();
+  assert.equal(run.result, true, run.output);
+  assert.deepEqual(run.checkpoints, ['next-key-prepublished', 'restart-same-keys', 'rotation-retained-key-overlap', 'logout-confirmed']);
+  assert.equal(run.keysReads, 2);
+  assert.match(run.output, /PASS restart-same-keys/);
+  assert.match(run.output, /PASS rotation-retained-key-overlap/);
+  assert.doesNotMatch(run.output, /synthetic-|2000000000|fixture-key/);
+});
+
+test('continuity fails closed on subject change, expired overlap, missing old key and unchanged kid', async () => {
+  for (const change of [{ wrongSubject: true }, { expired: true }, { missingKey: true }, { missingNewKey: true }, { overlapExpired: true }, { sameKid: true }]) {
+    const run = await continuityFixture(change);
+    assert.equal(run.result, false);
+    assert.doesNotMatch(run.output, /synthetic-|other-private-subject|fixture-key/);
+    assert.doesNotMatch(run.output, /PASS rotation-retained-key-overlap/);
+    assert.ok(run.keysReads <= 2);
+  }
+});
+
+test('manual aborts prevent the next grant and produce only sanitized stage failures', async () => {
+  for (const [abort, grants] of [['next-key-prepublished', 0], ['restart-same-keys', 1], ['rotation-retained-key-overlap', 2]]) {
+    const run = await continuityFixture({ abort });
+    assert.equal(run.result, false);
+    assert.equal(run.grants, grants);
+    assert.match(run.output, new RegExp(`FAIL ${abort}`));
+    assert.doesNotMatch(run.output, /synthetic-|diagnostic check failed/);
+  }
+});
+
+test('interactive Ctrl-C and EOF cancel discovery, real callback listener and manual checkpoint', { timeout: 5000 }, async () => {
+  const { PassThrough } = await import('node:stream');
+  const { runInteractive } = await import('./staging-oauth-smoke.mjs');
+  const metadata = { issuer, authorization_endpoint: `${issuer}/authorize`, token_endpoint: `${issuer}/token`,
+    jwks_uri: `${issuer}/jwks`, userinfo_endpoint: `${issuer}/userinfo`,
+    code_challenge_methods_supported: ['S256'], token_endpoint_auth_methods_supported: ['none'],
+    authorization_response_iss_parameter_supported: true };
+  for (const phase of ['discovery', 'callback', 'checkpoint', 'token']) {
+    for (const cancellation of ['SIGINT', 'EOF']) {
+      const input = new PassThrough(), terminalOutput = new PassThrough();
+      input.isTTY = terminalOutput.isTTY = true;
+      terminalOutput.columns = 80;
+      const lines = [];
+      let reads = 0, tokenCalls = 0, activeSignal, finishDiscovery, finishToken, callbackUrl, aborted = false;
+      const abort = () => {
+        if (aborted) return;
+        aborted = true;
+        if (cancellation === 'SIGINT') input.write('\x03'); else input.end();
+      };
+      terminalOutput.on('data', (chunk) => {
+        if (phase === 'checkpoint' && chunk.toString().includes('Checkpoint')) queueMicrotask(abort);
+      });
+      const request = async (url, options) => {
+        activeSignal = options.signal;
+        reads++;
+        if (phase === 'discovery') {
+          queueMicrotask(abort);
+          return new Promise((resolve) => { finishDiscovery = resolve; });
+        }
+        if (url.endsWith('/token')) {
+          tokenCalls++;
+          if (phase === 'token') {
+            queueMicrotask(abort);
+            return new Promise((resolve) => { finishToken = resolve; });
+          }
+        }
+        return { status: 200, data: url.endsWith('/jwks') ? jwks : metadata };
+      };
+      const run = runInteractive(issuer, { input, terminalOutput, request, continuity: phase === 'checkpoint',
+        listen: phase === 'token' ? async () => ({ code: 'synthetic-code' }) : undefined,
+        output: (line) => {
+          lines.push(line);
+          if (phase === 'callback' && line.startsWith(`${issuer}/authorize?`)) {
+            callbackUrl = new URL(line);
+            queueMicrotask(abort);
+          }
+        }, error: (line) => lines.push(line) });
+      assert.equal(await run, false, `${phase}/${cancellation}`);
+      assert.equal(activeSignal.aborted, true);
+      assert.equal(tokenCalls, phase === 'token' ? 1 : 0);
+      assert.doesNotMatch(lines.join('\n'), /"result":"pass"|PASS login-token-userinfo|PASS next-key-prepublished/);
+      assert.match(lines.join('\n'), /FAIL /);
+      if (finishDiscovery) {
+        finishDiscovery({ status: 200, data: metadata });
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(reads, 1); // A late response cannot resume discovery or grants.
+      }
+      if (finishToken) {
+        const previousReads = reads;
+        finishToken({ status: 200, data: { access_token: 'synthetic-late-token' } });
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(reads, previousReads); // No UserInfo or subsequent refresh after a late grant.
+      }
+      if (callbackUrl) {
+        const query = new URLSearchParams({ state: callbackUrl.searchParams.get('state'), iss: issuer, code: 'synthetic-late-code' });
+        await assert.rejects(fetch(`http://127.0.0.1:8765/callback?${query}`));
+        assert.equal(tokenCalls, 0);
+      }
+      input.destroy();
+      terminalOutput.destroy();
+    }
+  }
+});
+
+test('request cancellation reaches fetch transport without dropping its deadline', async () => {
+  const controller = new AbortController();
+  let observed;
+  const pending = requestJson(`${issuer}/userinfo`, { signal: controller.signal }, async (_url, options) => {
+    observed = options.signal;
+    return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(new Error('private-network-detail')), { once: true }));
+  });
+  controller.abort();
+  await assert.rejects(pending);
+  assert.equal(observed.aborted, true);
 });

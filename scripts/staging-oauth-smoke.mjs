@@ -58,7 +58,9 @@ export async function readJson(response) {
 
 export async function requestJson(url, options = {}, fetcher = fetch) {
   // The timeout remains active through body consumption, not just the headers.
-  const response = await fetcher(url, { ...options, redirect: 'error', signal: AbortSignal.timeout(15_000) });
+  const headers = new Headers(options.headers);
+  headers.set('user-agent', 'Balance-Delivery/1.0');
+  const response = await fetcher(url, { ...options, headers, redirect: 'error', signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000) });
   const data = await readJson(response);
   return { status: response.status, data };
 }
@@ -119,7 +121,7 @@ export function parseCallback(method, host, target, pending, issuer) {
   return error ? { error: true } : { code };
 }
 
-export async function listenForCallback(pending, issuer, onListening, deadlineMs = 300_000) {
+export async function listenForCallback(pending, issuer, onListening, deadlineMs = 300_000, signal) {
   let attempts = 0;
   let settled = false;
   let timer;
@@ -147,13 +149,18 @@ export async function listenForCallback(pending, issuer, onListening, deadlineMs
     if (settled) return;
     settled = true;
     clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
     server.close();
     server.closeAllConnections();
     if (error) rejectResult(error); else resolveResult(result);
   }
+  const abort = () => finish(new Error('diagnostic aborted'));
+  if (signal?.aborted) { abort(); return completion; }
+  signal?.addEventListener('abort', abort, { once: true });
   server.on('error', () => finish(new Error('callback listener unavailable')));
   timer = setTimeout(() => finish(new Error('callback deadline reached')), deadlineMs);
   server.listen(8765, '127.0.0.1', () => {
+    if (settled) { server.close(); return; }
     try { onListening(); } catch { finish(new Error('authorization display failed')); }
   });
   return completion;
@@ -208,30 +215,51 @@ export function assertInvalidGrant(result) {
   requireThat(result.status === 400 && result.data.error === 'invalid_grant');
 }
 
-async function main(args) {
-  if (args.length === 1 && args[0] === '--help') {
-    console.log('Usage: node scripts/staging-oauth-smoke.mjs --issuer https://STAGING-HOST');
-    console.log('Requires Node 24 and interactive browser login. Callback: 127.0.0.1:8765.');
-    return;
-  }
-  requireThat(args.length === 2 && args[0] === '--issuer' && process.stdin.isTTY);
-  const issuer = issuerPolicy(args[1]);
+// Race even injected IO against cancellation, and never start work after abort.
+async function cancellable(signal, operation) {
+  signal?.throwIfAborted();
+  if (!signal) return operation();
+  let abort;
+  const cancelled = new Promise((_, reject) => {
+    abort = () => reject(new Error('diagnostic aborted'));
+    signal.addEventListener('abort', abort, { once: true });
+  });
+  try { return await Promise.race([cancelled, operation()]); }
+  finally { signal.removeEventListener('abort', abort); }
+}
+
+// Manual acknowledgements are deliberately exact and bounded; an empty answer aborts.
+export async function manualCheckpoint(name, ask) {
+  requireThat(await ask(`Checkpoint ${name}: type CONTINUE after the reviewed operation, or abort: `) === 'CONTINUE');
+}
+
+export async function runDiagnostic(issuer, { continuity = false, request: rawRequest = requestJson, signal,
+  listen = listenForCallback, checkpoint, output = console.log, error = console.error,
+  now = () => Math.floor(Date.now() / 1000) } = {}) {
+  issuerPolicy(issuer);
   const stages = [];
   let stage = 'discovery';
-  const pass = (name) => { stages.push(name); console.log(`PASS ${name}`); };
+  const request = (url, options = {}) => cancellable(signal, () => rawRequest(url, { ...options, signal }));
+  const pause = (name) => cancellable(signal, () => checkpoint(name));
+  const pass = (name) => { signal?.throwIfAborted(); stages.push(name); output(`PASS ${name}`); };
   try {
-    const oidc = await requestJson(`${issuer}/.well-known/openid-configuration`);
-    const as = await requestJson(`${issuer}/.well-known/oauth-authorization-server`);
+    const oidc = await request(`${issuer}/.well-known/openid-configuration`);
+    const as = await request(`${issuer}/.well-known/oauth-authorization-server`);
     requireThat(oidc.status === 200 && as.status === 200);
     const endpoints = validateMetadata(oidc.data, issuer);
     const other = validateMetadata(as.data, issuer);
     requireThat(Object.keys(endpoints).every((name) => endpoints[name] === other[name]));
-    const jwksResult = await requestJson(endpoints.jwks_uri);
+    const jwksResult = await request(endpoints.jwks_uri);
     requireThat(jwksResult.status === 200);
-    const jwks = jwksResult.data;
+    let jwks = jwksResult.data;
     pass(stage);
+    if (continuity) {
+      stage = 'next-key-prepublished';
+      await pause(stage);
+      pass(stage);
+    }
     const requests = oauthRequestBuilder(endpoints);
-    const post = (fields) => requestJson(endpoints.token_endpoint, {
+    const post = (fields) => request(endpoints.token_endpoint, {
       method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
       body: requests.token(fields),
     });
@@ -241,31 +269,60 @@ async function main(args) {
       requireThat(Number.isSafeInteger(result.data.expires_in) && result.data.expires_in > 0);
       const access = verifyJwt(result.data.access_token, jwks, {
         typ: 'at+jwt', issuer, client: CLIENT, audiences: [endpoints.userinfo_endpoint],
-      });
+      }, now());
+      if (continuity) requireThat(access.exp > now());
       if (nonce !== undefined) {
-        const id = verifyJwt(result.data.id_token, jwks, { typ: 'JWT', issuer, client: CLIENT, audiences: [CLIENT], nonce });
-        requireThat(id.sub === access.sub);
+        const id = verifyJwt(result.data.id_token, jwks, { typ: 'JWT', issuer, client: CLIENT, audiences: [CLIENT], nonce }, now());
+        requireThat(id.sub === access.sub && (!continuity || id.exp > now()));
       } else requireThat(!('id_token' in result.data));
       if (priorSubject !== undefined) requireThat(access.sub === priorSubject);
-      const info = await requestJson(endpoints.userinfo_endpoint, {
+      const info = await request(endpoints.userinfo_endpoint, {
         headers: { authorization: `Bearer ${result.data.access_token}`, accept: 'application/json' },
       });
-      requireThat(info.status === 200 && info.data.sub === access.sub);
-      return { refresh: result.data.refresh_token, subject: access.sub };
+      requireThat(info.status === 200 && info.data.sub === access.sub && (!continuity || access.exp > now()));
+      return { refresh: result.data.refresh_token, subject: access.sub, access: result.data.access_token,
+        kid: decodePart(result.data.access_token.split('.')[0]).kid };
     }
     async function authorize(label) {
       const pending = transaction();
       const url = requests.authorization(pending);
-      const callback = await listenForCallback(pending, issuer, () => {
-        console.log(`Open this transient authorization URL in your browser (${label}). Do not save or share it:`);
-        console.log(url.href);
-      });
+      const callback = await cancellable(signal, () => listen(pending, issuer, () => {
+        signal?.throwIfAborted();
+        output(`Open this transient authorization URL in your browser (${label}). Do not save or share it:`);
+        output(url.href);
+      }, 300_000, signal));
       return checkTokens(await post({ grant_type: 'authorization_code', code: callback.code,
         redirect_uri: CALLBACK, code_verifier: pending.verifier }), pending.nonce);
     }
     stage = 'login-token-userinfo';
     const first = await authorize('refresh replay family');
     pass(stage);
+    if (continuity) {
+      stage = 'restart-same-keys';
+      await pause(stage);
+      const restarted = await checkTokens(await post({ grant_type: 'refresh_token', refresh_token: first.refresh }), undefined, first.subject);
+      requireThat(restarted.refresh !== first.refresh && restarted.kid === first.kid);
+      pass(stage);
+      stage = 'rotation-retained-key-overlap';
+      await pause(stage);
+      // Refresh once, with no polling or grant retries. The operator must prepublish
+      // the next public key before login so cache propagation precedes this grant.
+      const freshKeys = await request(endpoints.jwks_uri);
+      requireThat(freshKeys.status === 200);
+      jwks = freshKeys.data;
+      const old = verifyJwt(restarted.access, jwks, {
+        typ: 'at+jwt', issuer, client: CLIENT, audiences: [endpoints.userinfo_endpoint],
+      }, now());
+      requireThat(old.exp > now() && old.sub === first.subject);
+      const oldInfo = await request(endpoints.userinfo_endpoint, {
+        headers: { authorization: `Bearer ${restarted.access}`, accept: 'application/json' },
+      });
+      requireThat(oldInfo.status === 200 && oldInfo.data.sub === first.subject && old.exp > now());
+      const rekeyed = await checkTokens(await post({ grant_type: 'refresh_token', refresh_token: restarted.refresh }), undefined, first.subject);
+      requireThat(rekeyed.kid !== restarted.kid && rekeyed.refresh !== restarted.refresh && old.exp > now());
+      Object.assign(first, rekeyed);
+      pass(stage);
+    }
     stage = 'refresh-rotation';
     const rotated = await checkTokens(await post({ grant_type: 'refresh_token', refresh_token: first.refresh }), undefined, first.subject);
     requireThat(rotated.refresh !== first.refresh);
@@ -280,19 +337,54 @@ async function main(args) {
     requireThat(live.refresh !== second.refresh);
     pass(stage);
     stage = 'logout-revocation';
-    console.log(`In the SAME browser, open ${issuer}/logout and confirm Eri logout.`);
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    try { await rl.question('After the browser confirms logout, press Enter here: ', { signal: AbortSignal.timeout(300_000) }); }
-    finally { rl.close(); }
+    output(`In the SAME browser, open ${issuer}/logout and confirm Eri logout.`);
+    await pause('logout-confirmed');
     assertInvalidGrant(await post({ grant_type: 'refresh_token', refresh_token: live.refresh }));
     pass(stage);
-    console.log(JSON.stringify({ diagnostic: 'eri-staging-oauth', result: 'pass', stages }));
+    signal?.throwIfAborted();
+    output(JSON.stringify({ diagnostic: 'eri-staging-oauth', result: 'pass', stages }));
   } catch {
     // Never emit server bodies, exceptions, claims, codes or credentials.
-    console.error(`FAIL ${stage}`);
-    console.log(JSON.stringify({ diagnostic: 'eri-staging-oauth', result: 'fail', stage, stages }));
-    process.exitCode = 1;
+    error(`FAIL ${stage}`);
+    output(JSON.stringify({ diagnostic: 'eri-staging-oauth', result: 'fail', stage, stages }));
+    return false;
   }
+  return true;
+}
+
+export async function runInteractive(issuer, { input = process.stdin, terminalOutput = process.stdout,
+  output = console.log, error = console.error, ...options } = {}) {
+  const controller = new AbortController();
+  const rl = createInterface({ input, output: terminalOutput });
+  const abort = () => controller.abort();
+  rl.once('SIGINT', abort);
+  rl.once('close', abort); // EOF and closed terminal are cancellation, too.
+  process.once('SIGINT', abort);
+  try {
+    const ask = (prompt) => rl.question(prompt, {
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(300_000)]),
+    });
+    const checkpoint = (name) => name === 'logout-confirmed'
+      ? ask('After the browser confirms logout, press Enter here: ')
+      : manualCheckpoint(name, ask);
+    return await runDiagnostic(issuer, { ...options, checkpoint, output, error, signal: controller.signal });
+  } finally {
+    rl.removeListener('SIGINT', abort);
+    rl.removeListener('close', abort);
+    process.removeListener('SIGINT', abort);
+    rl.close();
+  }
+}
+
+async function main(args) {
+  if (args.length === 1 && args[0] === '--help') {
+    console.log('Usage: node scripts/staging-oauth-smoke.mjs --issuer https://STAGING-HOST [--live-continuity]');
+    return;
+  }
+  const continuity = args.length === 3 && args[2] === '--live-continuity';
+  requireThat((args.length === 2 || continuity) && args[0] === '--issuer' && process.stdin.isTTY);
+  const issuer = issuerPolicy(args[1]);
+  if (!await runInteractive(issuer, { continuity })) process.exitCode = 1;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

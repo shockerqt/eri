@@ -65,6 +65,50 @@ port 8765 publicly or change OCI/Nginx/firewall rules for this callback.
    press Enter in the terminal. The client proves the latest refresh token is
    rejected with HTTP 400 `invalid_grant`.
 
+To additionally exercise live persistence and signing rotation, use the explicit mode:
+
+```sh
+node scripts/staging-oauth-smoke.mjs --issuer https://REVIEWED-STAGING-HOST --live-continuity
+```
+
+Coordinate this run with INF-015 before starting. Its reviewed operational recipe
+must include protected backups, expected keys, cache overlap and rollback. The
+client executes no service, key, configuration or infrastructure command. Never
+paste tokens, subjects, key material or operational output into a checkpoint.
+There are three manual checkpoints; type exactly `CONTINUE` after each reviewed
+operation succeeds. Any other answer, timeout or interruption aborts the run. Ctrl-C, terminal EOF
+or terminal closure cancel outstanding requests, close the callback listener and
+end with a sanitized failure and nonzero exit status. A late callback or network
+response cannot resume the run. Cancellation performs no remote cleanup or grant
+retry; a request already accepted by the server may have changed the grant.
+
+1. `next-key-prepublished`, before any authorization: INF-015 must prepublish the
+   next public key alongside the current public key and complete its reviewed
+   propagation/cache wait. Keep the current signing key active. This wait must
+   precede the grant so it cannot consume the old access token's overlap lifetime.
+2. `restart-same-keys`, after the first Google grant: restart through the reviewed
+   INF-015 procedure with the same persistent signing keys. Continue promptly.
+   The client refreshes the existing family and requires a changed refresh token,
+   the identical subject and the same signing `kid`.
+3. `rotation-retained-key-overlap`: activate the reviewed next signing key while
+   retaining the old public verification key. Continue promptly, before the
+   existing access token expires. The client fetches JWKS exactly once (no cache
+   polling or refresh-grant retries), verifies the old access token against that
+   set and calls UserInfo with it. It then refreshes the same grant, requiring a
+   changed refresh token, a different `kid`, the exact issuer and identical
+   subject. Both tokens must verify with the refreshed public set; the old token
+   must remain strictly unexpired through completion. All access and ID token
+   expiry checks in this mode require `exp` strictly after the current time,
+   rather than treating clock tolerance as proof of live overlap.
+
+The usual refresh/replay and second authorization/logout stages then continue.
+A failed overlap (including expiry, missing old/new key or unchanged signing kid)
+is incomplete evidence. Start a new authorized run rather than retrying a grant.
+Checkpoints certify human acknowledgement only; the token and UserInfo checks
+supply the continuity evidence. They do not independently attest how an operator
+performed a service/key operation. Output remains stage names and the sanitized
+final summary; no subject, token or timestamp is added to receipts or logs.
+
 Use plain `/logout` without post-logout redirects. `/logout?client_id=eri-staging-cli`
 alone is invalid because Eri requires a registered destination with that form of
 logout. The diagnostic relies on the real browser's provider session cookie and
@@ -79,7 +123,8 @@ disk by this client. Credentials live only in process memory. Browser history
 and the browser's normal Google/Eri storage are outside this process; use an
 appropriate staging browser profile and close it after the run. The callback
 page has no query echo, `no-store`, `no-referrer` and restrictive CSP headers.
-Each network request has a fifteen-second deadline through body consumption and
+Requests use the reviewed `Balance-Delivery/1.0` User-Agent, including preflight
+discovery. Each network request has a fifteen-second deadline through body consumption and
 a one-MiB response limit. The script never emits caught exception details.
 
 Record only the final JSON summary and deterministic `PASS`/`FAIL` stage names as
@@ -91,7 +136,9 @@ An interrupted or expired run is incomplete and must not be recorded as a pass.
 After an ambiguous refresh transport failure, start a new run rather than manually
 retrying a token: the server may already have rotated it.
 
-This diagnostic does not prove restart persistence, key rotation, RAM or latency
+The default diagnostic does not prove restart persistence or key rotation.
+Only a successful real `--live-continuity` run supplies the bounded grant and
+key-overlap evidence described above. Neither mode proves RAM or latency
 targets, native/mobile login, or a real Gemini Spark MCP connection. Those remain
 separate acceptance gates. It does not revoke already-issued self-contained
 access tokens; Eri's documented short access-token lifetime still applies.

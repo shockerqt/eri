@@ -44,6 +44,14 @@ jobs:
       - run: make test
         env:
           ERI_PROVIDER_PROOF_CONTAINER: ${{ job.services.postgres.id }}
+      - name: Provision pinned synthetic browser runtime
+        run: |
+          npm install --prefix "$RUNNER_TEMP/eri-browser" --no-save --package-lock=false playwright@1.63.0
+          "$RUNNER_TEMP/eri-browser/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Verify consent callbacks across chained origins
+        run: |
+          ERI_PLAYWRIGHT_MODULE="$RUNNER_TEMP/eri-browser/node_modules/playwright" \
+            cargo test --locked web::tests::chromium_follows_bound_consent_and_logout_redirects -- --ignored --nocapture
       - run: make build
       - name: Package identified binary
         run: |

@@ -116,10 +116,15 @@ lowercased, trimmed, or otherwise normalized.
 ## Browser flow regression
 
 The ignored browser regression starts Eri, a signed synthetic Google upstream,
-and a separate callback origin on ephemeral loopback listeners. It uses Chromium
-to submit the Google start, consent, logout, and cancellation forms at a narrow
-viewport and verifies that their bound cross-origin redirects complete without
-CSP violations. Supply
+and separate callback and final origins on ephemeral loopback listeners. It uses
+Chromium with page JavaScript disabled to verify a direct HTTP 200 callback,
+approved and denied consent through a callback HTTP 303 to the final origin,
+and the fallback link when the synthetic response omits automatic refresh. It
+also submits logout and login cancellation, rejects replayed consent locally,
+and checks bound parameters, no leaked callback/final referrer, narrow viewport
+layout and CSP violations. Browser routing rejects non-loopback traffic. CI
+explicitly provisions Playwright 1.63.0 with Chromium and runs this ignored test
+after the ordinary suite; a normal `cargo test` alone does not run it. Supply
 an installed Playwright module and browser/runtime paths explicitly:
 
 ```sh
@@ -141,7 +146,21 @@ on form, stylesheet, and client callback requests.
 Login, consent, and logout form documents use `Referrer-Policy: strict-origin`: Chromium
 therefore supplies the same-origin `Origin` needed by the CSRF check while any
 subsequent client navigation receives at most Eri's origin, never the callback,
-state, code, or CSRF query. Other sensitive responses retain `no-referrer`. This
+state, code, or CSRF query. Successful HTTP(S) consent POSTs finish with a private HTTP 200 document, an
+immediate meta refresh to the already validated exact callback and a generic
+fallback link. This ends the form submission redirect chain before a callback
+can redirect onward to another origin; Chromium otherwise applies the original
+form document's `form-action` restriction to that chain. The response has no
+Location header, scripts or remote assets and retains the strict CSP plus
+`no-store` and `no-referrer`. Both code and denial responses use the existing
+parameter serializer and HTML attribute escaping; no callback origin allowlist
+is widened. Native custom-scheme consent returns keep their existing HTTP 303
+activation, as do authorization/federation GETs and logout. Local errors remain
+local HTTP 400 pages without a return target. No new callback endpoint or
+credential storage is introduced. The fixture demonstrates the browser mechanism,
+not a captured Google redirect chain or live Spark acceptance.
+
+Other sensitive responses retain `no-referrer`. This
 behavior follows the Fetch request-Origin algorithm and the Referrer Policy
 `strict-origin` definition:
 

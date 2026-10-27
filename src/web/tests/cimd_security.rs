@@ -152,12 +152,7 @@ async fn action(
 async fn code(app: &Router, session: &ProviderSession, redirect: &str) -> String {
     let handle = consent(app, session, redirect).await;
     let response = action(app, session, &handle, "approve").await;
-    assert_eq!(response.status(), StatusCode::SEE_OTHER);
-    let uri: url::Url = response.headers()[header::LOCATION]
-        .to_str()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let uri = consent_http_target(response).await;
     uri.query_pairs()
         .find(|(key, _)| key == "code")
         .unwrap()
@@ -296,10 +291,14 @@ async fn metadata_changes_and_outages_fail_without_consuming_grants(pool: PgPool
                 .unwrap();
         assert_eq!(stage, "awaiting_consent");
         change_source(&source, Some(document()));
-        assert_eq!(
-            action(&app, &session, &handle, "deny").await.status(),
-            StatusCode::SEE_OTHER
-        );
+        let denied = consent_http_target(action(&app, &session, &handle, "deny").await).await;
+        let values = denied
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(values["error"], "access_denied");
+        assert_eq!(values["state"], "bound-state");
+        assert_eq!(values["iss"], ISSUER);
+        assert!(!values.contains_key("code"));
     }
     let original_code = code(&app, &session, REDIRECT).await;
     for metadata in [Some(changed_document()), None] {

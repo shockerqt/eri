@@ -299,12 +299,7 @@ async fn run_resource_contract(pool: PgPool, generic: bool) {
         )
         .await
         .unwrap();
-    assert_eq!(approved.status(), StatusCode::SEE_OTHER);
-    let returned: url::Url = approved.headers()[header::LOCATION]
-        .to_str()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let returned = consent_http_target(approved).await;
     assert_eq!(returned.as_str().split('?').next().unwrap(), redirect);
     let callback_values = returned
         .query_pairs()
@@ -466,12 +461,7 @@ async fn run_resource_contract(pool: PgPool, generic: bool) {
         )
         .await
         .unwrap();
-    assert_eq!(approved.status(), StatusCode::SEE_OTHER);
-    let location: url::Url = approved.headers()[header::LOCATION]
-        .to_str()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let location = consent_http_target(approved).await;
     let code = location
         .query_pairs()
         .find(|(key, _)| key == "code")

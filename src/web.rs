@@ -794,11 +794,13 @@ async fn consent_post(State(s): State<AppState>, headers: HeaderMap, body: Bytes
         match action {
             "approve" => match store.approve(&session, &h, &registry).await {
                 Ok(v) => {
-                    return code_redirect(
+                    return consent_return(
                         &v.redirect_uri,
-                        v.downstream_state.as_deref(),
-                        &p.issuer,
-                        v.code.expose(),
+                        &[
+                            ("code", Some(v.code.expose())),
+                            ("state", v.downstream_state.as_deref()),
+                            ("iss", Some(&p.issuer)),
+                        ],
                     );
                 }
                 Err(crate::BrowserError::MetadataExpired) if attempt == 0 => continue,
@@ -806,11 +808,13 @@ async fn consent_post(State(s): State<AppState>, headers: HeaderMap, body: Bytes
             },
             "deny" => match store.deny_with_registry(&session, &h, &registry).await {
                 Ok(v) => {
-                    return oauth_redirect(
+                    return consent_return(
                         &v.redirect_uri,
-                        v.downstream_state.as_deref(),
-                        &p.issuer,
-                        "access_denied",
+                        &[
+                            ("error", Some("access_denied")),
+                            ("state", v.downstream_state.as_deref()),
+                            ("iss", Some(&p.issuer)),
+                        ],
                     );
                 }
                 Err(crate::BrowserError::MetadataExpired) if attempt == 0 => continue,
@@ -1335,7 +1339,7 @@ fn bearer<'a>(h: &'a HeaderMap, f: &'a [(String, String)]) -> Option<&'a str> {
         _ => None,
     }
 }
-fn redirect_params(base: &str, items: &[(&str, Option<&str>)]) -> Response {
+fn redirect_url(base: &str, items: &[(&str, Option<&str>)]) -> String {
     let mut url = base.to_owned();
     let mut e = form_urlencoded::Serializer::new(String::new());
     for (k, v) in items {
@@ -1348,7 +1352,22 @@ fn redirect_params(base: &str, items: &[(&str, Option<&str>)]) -> Response {
         url.push(if base.contains('?') { '&' } else { '?' });
         url.push_str(&q)
     }
-    Redirect::to(&url).into_response()
+    url
+}
+fn redirect_params(base: &str, items: &[(&str, Option<&str>)]) -> Response {
+    Redirect::to(&redirect_url(base, items)).into_response()
+}
+// Only validated consent outcomes reach this presentation step. A completed POST
+// document ends Chromium's form-action redirect chain before an HTTP callback
+// redirects to another origin. Native scheme activation keeps its existing 303.
+fn consent_return(base: &str, items: &[(&str, Option<&str>)]) -> Response {
+    if !url::Url::parse(base).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
+        return sensitive(redirect_params(base, items));
+    }
+    let target = escape(&redirect_url(base, items));
+    sensitive(Html(format!(
+        "<!doctype html><html lang=es><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta http-equiv=refresh content=\"0;url={target}\"><title>Continuar · Eri</title></head><body><main><h1>Continuar</h1><p><a href=\"{target}\">Volver a la aplicación</a></p></main></body></html>"
+    )).into_response())
 }
 fn oauth_redirect(base: &str, state: Option<&str>, issuer: &str, error: &str) -> Response {
     sensitive(redirect_params(
@@ -1708,6 +1727,11 @@ mod tests {
                             RedirectKind::Exact,
                         )
                         .unwrap(),
+                        RegisteredRedirect::new(
+                            format!("{client_origin}/callback-direct"),
+                            RedirectKind::Exact,
+                        )
+                        .unwrap(),
                     ],
                     ["openid", "profile", "email", "offline_access"],
                     ["https://api.example/resource"],
@@ -1725,6 +1749,52 @@ mod tests {
         let marker = format!("name={name} value=\"");
         let rest = html.split_once(&marker).unwrap().1;
         rest.split_once('"').unwrap().0.into()
+    }
+    fn consent_target(html: &str) -> url::Url {
+        html.split_once("<a href=\"")
+            .unwrap()
+            .1
+            .split_once('"')
+            .unwrap()
+            .0
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+            .parse()
+            .unwrap()
+    }
+    async fn consent_http_target(response: Response) -> url::Url {
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert!(!headers.contains_key(header::LOCATION));
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(headers[header::PRAGMA], "no-cache");
+        assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
+        assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(headers["x-frame-options"], "DENY");
+        assert_eq!(
+            headers[header::CONTENT_SECURITY_POLICY],
+            "default-src 'none'; style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+        );
+        let html = body(response).await;
+        let href = html
+            .split_once("<a href=\"")
+            .unwrap()
+            .1
+            .split_once('"')
+            .unwrap()
+            .0;
+        assert!(html.contains(&format!(
+            "<meta http-equiv=refresh content=\"0;url={href}\">"
+        )));
+        assert!(html.contains(&format!("<a href=\"{href}\">Volver a la aplicación</a>")));
+        assert!(!html.contains("<script"));
+        assert!(!html.contains("<form"));
+        let target = consent_target(&html);
+        assert!(matches!(target.scheme(), "http" | "https"));
+        target
     }
     fn cookie_value(response: &Response) -> String {
         response
@@ -1809,15 +1879,40 @@ mod tests {
         let eri_origin = format!("http://{}", eri_listener.local_addr().unwrap());
         let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client_origin = format!("http://{}", client_listener.local_addr().unwrap());
+        let final_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let final_origin = format!("http://{}", final_listener.local_addr().unwrap());
+        let final_hits = Arc::new(AtomicUsize::new(0));
+        let final_count = final_hits.clone();
+        let final_app = Router::new().route(
+            "/complete",
+            get(move || {
+                final_count.fetch_add(1, Ordering::SeqCst);
+                async { "synthetic final callback reached" }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(final_listener, final_app).await.unwrap() });
         let client_hits = Arc::new(AtomicUsize::new(0));
         let callback_hits = client_hits.clone();
+        let direct_hits = client_hits.clone();
         let signed_out_hits = client_hits.clone();
+        let final_destination = final_origin.clone();
         let client = Router::new()
             .route(
                 "/callback",
+                get(
+                    move |axum::extract::OriginalUri(uri): axum::extract::OriginalUri| {
+                        callback_hits.fetch_add(1, Ordering::SeqCst);
+                        let destination =
+                            format!("{final_destination}/complete?{}", uri.query().unwrap_or(""));
+                        async move { sensitive(Redirect::to(&destination).into_response()) }
+                    },
+                ),
+            )
+            .route(
+                "/callback-direct",
                 get(move || {
-                    callback_hits.fetch_add(1, Ordering::SeqCst);
-                    async { "authorization callback reached" }
+                    direct_hits.fetch_add(1, Ordering::SeqCst);
+                    async { "synthetic direct callback reached" }
                 }),
             )
             .route(
@@ -1898,6 +1993,8 @@ mod tests {
         let status = tokio::task::spawn_blocking({
             let eri_origin = eri_origin.clone();
             let client_origin = client_origin.clone();
+            let final_origin = final_origin.clone();
+            let upstream_origin = upstream_origin.clone();
             move || {
                 std::process::Command::new("timeout")
                     .arg("60s")
@@ -1905,6 +2002,8 @@ mod tests {
                     .arg("tests/browser-flow.cjs")
                     .arg(eri_origin)
                     .arg(client_origin)
+                    .arg(final_origin)
+                    .arg(upstream_origin)
                     .status()
                     .unwrap()
             }
@@ -1912,7 +2011,16 @@ mod tests {
         .await
         .unwrap();
         assert!(status.success());
-        assert_eq!(client_hits.load(Ordering::SeqCst), 12);
+        assert_eq!(client_hits.load(Ordering::SeqCst), 15);
+        assert_eq!(final_hits.load(Ordering::SeqCst), 3);
+        let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM authorization_codes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            codes, 3,
+            "deny and callback navigation must not issue another code"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -2775,12 +2883,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(approved.status(), StatusCode::SEE_OTHER);
-        let returned: url::Url = approved.headers()[header::LOCATION]
-            .to_str()
-            .unwrap()
-            .parse()
-            .unwrap();
+        let returned = consent_http_target(approved).await;
         assert_eq!(
             returned.as_str().split('?').next().unwrap(),
             "https://app.example/callback"
@@ -3003,11 +3106,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let second_returned: url::Url = second_approved.headers()[header::LOCATION]
-            .to_str()
-            .unwrap()
-            .parse()
-            .unwrap();
+        let second_returned = consent_http_target(second_approved).await;
         let second_code = second_returned
             .query_pairs()
             .find(|(key, _)| key == "code")
@@ -3124,6 +3223,76 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&body(response).await).unwrap(),
             json!({"error":"server_error"})
         );
+    }
+
+    #[tokio::test]
+    async fn consent_http_return_is_inert_private_and_escapes_the_exact_bound_target() {
+        let base = "https://app.example/callback?fixed=%2F&label='\"><script>inert</script>";
+        let state = "state&\"'<tag>";
+        for items in [
+            vec![
+                ("code", Some("code&\"'<tag>")),
+                ("state", Some(state)),
+                ("iss", Some("https://issuer.example")),
+            ],
+            vec![
+                ("error", Some("access_denied")),
+                ("state", Some(state)),
+                ("iss", Some("https://issuer.example")),
+            ],
+        ] {
+            let response = consent_return(base, &items);
+            assert_eq!(response.status(), StatusCode::OK);
+            let headers = response.headers();
+            assert!(!headers.contains_key(header::LOCATION));
+            assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+            assert_eq!(headers[header::PRAGMA], "no-cache");
+            assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
+            assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+            assert_eq!(headers["x-frame-options"], "DENY");
+            assert_eq!(
+                headers[header::CONTENT_SECURITY_POLICY],
+                "default-src 'none'; style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+            );
+            let html = body(response).await;
+            let target = redirect_url(base, &items);
+            let escaped = escape(&target);
+            assert!(html.contains(&format!(
+                "<meta http-equiv=refresh content=\"0;url={escaped}\">"
+            )));
+            assert!(html.contains(&format!("<a href=\"{escaped}\">Volver a la aplicación</a>")));
+            assert!(!html.contains("<script>"));
+            assert!(!html.contains("<form"));
+            assert!(!html.contains("<link"));
+            assert_eq!(
+                consent_target(&html)
+                    .query_pairs()
+                    .find(|(key, _)| key == "state")
+                    .unwrap()
+                    .1,
+                state
+            );
+        }
+        let native = consent_return(
+            "com.example.app:/oauth/callback?fixed=%2F",
+            &[("code", Some("bound-code"))],
+        );
+        assert_eq!(native.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            native.headers()[header::LOCATION],
+            "com.example.app:/oauth/callback?fixed=%2F&code=bound-code"
+        );
+        let regular_get = code_redirect(
+            "https://app.example/callback",
+            Some("state"),
+            "https://issuer.example",
+            "bound-code",
+        );
+        assert_eq!(regular_get.status(), StatusCode::SEE_OTHER);
+        let error = local_error("La solicitud expiró");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert!(!error.headers().contains_key(header::LOCATION));
+        assert!(!body(error).await.contains("http-equiv=refresh"));
     }
 
     #[test]
